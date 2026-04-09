@@ -673,8 +673,8 @@ class MeteoRaster(object):
 
         return completeness_index
 
-    @staticmethod
-    def get_completeness(file) -> bool:
+    @classmethod
+    def get_completeness(cls, file) -> bool:
         '''
         Docstring for check_completeness
         
@@ -684,7 +684,7 @@ class MeteoRaster(object):
         '''
 
         try:
-            with xr.open_dataset(Path(file), decode_times=False, engine=self.ENGINE) as ds:
+            with xr.open_dataset(Path(file), decode_times=False, engine=cls.ENGINE) as ds:
                 return ds.attrs['complete'].lower() in ['true', 'yes']
         except Exception as ex:
             raise(ex)
