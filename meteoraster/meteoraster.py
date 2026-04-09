@@ -23,6 +23,9 @@ class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
     
+    v2.2:
+        Specifies the saving engine as 'h5netcdf'
+
     v2.1:
         Updated to VSCode
         Updated to drop pickle and use cross-platfrom alternatives instead
@@ -34,7 +37,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '2.01'
+    VERSION = '2.2'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
     
@@ -715,9 +718,9 @@ class MeteoRaster(object):
                 encoding = {
                     self.variable: {"zlib": True, "complevel": complevel},
                 }
-                ds.to_netcdf(tmp_file, encoding=encoding)
+                ds.to_netcdf(tmp_file, encoding=encoding, engine='h5netcdf')
             else:
-                ds.to_netcdf(tmp_file)
+                ds.to_netcdf(tmp_file, engine='h5netcdf')
 
             shutil.move(tmp_file, file)
         except Exception:
