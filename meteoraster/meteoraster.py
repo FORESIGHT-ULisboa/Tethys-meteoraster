@@ -40,6 +40,8 @@ class MeteoRaster(object):
     VERSION = '2.2'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
+
+    ENGINE = 'h5netcdf'
     
     def __init__(self, data,
                  latitudes=None, longitudes=None, production_datetime=None, leadtimes=None,
@@ -682,7 +684,7 @@ class MeteoRaster(object):
         '''
 
         try:
-            with xr.open_dataset(Path(file), decode_times=False) as ds:
+            with xr.open_dataset(Path(file), decode_times=False, engine=self.ENGINE) as ds:
                 return ds.attrs['complete'].lower() in ['true', 'yes']
         except Exception as ex:
             raise(ex)
@@ -718,9 +720,9 @@ class MeteoRaster(object):
                 encoding = {
                     self.variable: {"zlib": True, "complevel": complevel},
                 }
-                ds.to_netcdf(tmp_file, encoding=encoding, engine='h5netcdf')
+                ds.to_netcdf(tmp_file, encoding=encoding, engine=self.ENGINE)
             else:
-                ds.to_netcdf(tmp_file, engine='h5netcdf')
+                ds.to_netcdf(tmp_file, engine=self.ENGINE)
 
             shutil.move(tmp_file, file)
         except Exception:
@@ -790,7 +792,7 @@ class MeteoRaster(object):
         if file.suffix.lower() not in {'.nc', '.nct'}:
             raise ValueError('Only NetCDF files written by save() are supported.')
 
-        with xr.open_dataset(file) as ds:
+        with xr.open_dataset(file, engine=cls.ENGINE) as ds:
             # pick the first data variable if name is unknown
             var_name = cls.__detect_variable_name(ds)
             da = ds[var_name]
