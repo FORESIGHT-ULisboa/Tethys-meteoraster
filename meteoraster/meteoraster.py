@@ -23,6 +23,9 @@ class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
     
+    v2.3:
+        Fixed a bug in the groupByMatrix function where the coverage was not updated to reflect missing data, which could lead to incorrect aggregations. The coverage is now set to 0 for pixels where data is not valid before performing the aggregation.
+
     v2.2:
         Specifies the saving engine as 'h5netcdf'
 
@@ -37,7 +40,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '2.2'
+    VERSION = '2.3'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
 
@@ -331,7 +334,7 @@ class MeteoRaster(object):
         start = tmp[0]
         end = tmp[-1]+1
         
-        self.data = self.data[start:end, :, : ,:, :]
+        self.data = self.data[start:end, ...]
         self.production_datetime = self.production_datetime[start:end]
     
     def join(self, meteoRaster, strickt=False, trim=False):
@@ -905,13 +908,13 @@ class MeteoRaster(object):
         '''
         
         self._diag('Executing spatial aggregation...', self.verbose)
-        
+
         #Verification of valid tiles (assumes first coverage zone to be representative (for speed and memory)
-        val = np.isfinite(self.data).astype(bool)
-        cvr = np.tile(coverage[:, :, :, :, :, 0].astype(np.single), list(val.shape[:(val.ndim-2)]) + [1, 1])
-        val = np.nansum(cvr*val, axis=(-2, -1))>0.8
+        val_ = np.isfinite(self.data).astype(bool)
+        cvr = np.tile(coverage[:, :, :, :, :, 0].astype(np.single), list(val_.shape[:(val_.ndim-2)]) + [1, 1])
+        val = np.nansum(cvr*val_, axis=(-2, -1))>0.8
         val = np.tile(np.expand_dims(val,-1), [1]*val.ndim + [coverage.shape[-1]])
-        
+
         if elementwise:
             agg = np.empty(list(self.data.shape[:3]) + [len(columns)]).astype(np.single) * np.NaN
             
@@ -925,7 +928,17 @@ class MeteoRaster(object):
             #Creation of matrices for calculation
             dat = np.tile(np.expand_dims(self.data.astype(np.single), axis=-1), [1]*self.data.ndim + [coverage.shape[-1]])
             cvr = np.tile(coverage.astype(np.single), list(dat.shape[:(dat.ndim-3)]) + [1, 1, 1])
-            dat *= cvr
+            
+            #Correction of the coveragefor missing data
+            dat_finite = np.isfinite(dat).astype(bool)
+            cvr_finite = cvr.copy()
+            cvr_finite[~dat_finite] = 0
+            weight_update = 1 / cvr_finite.sum(axis=(-3, -2))
+            weight_update = np.tile(weight_update[:, :, :, np.newaxis, np.newaxis, :], [1, 1, 1] + list(cvr.shape[-3:-1]) + [1])
+
+            dat *= cvr 
+            dat *= weight_update 
+
             cvr = None
             gc.collect()
             
@@ -1180,14 +1193,14 @@ class MeteoRaster(object):
         
         return cvr, columns, centroids
         
-    def __correctKMLHeader(self, kml):
+    def __correctKMLHeader(self, kml, encoding='utf-8'):
         '''
         Corrects the header of a KML file to that it can be read for model data preparation
         '''
         
         modificationRequired = False
         line = ''
-        with open(kml, 'r') as file:
+        with open(kml, 'r', encoding=encoding) as file:
             for line in file:
                 if line.strip().startswith('<kml'):
                     if line.strip() != '<kml>':
@@ -1199,8 +1212,8 @@ class MeteoRaster(object):
                 kml = str(kml)
                 
             tmpKML = kml.replace('.kml', '__tmp.kml')
-            with open(kml, 'r') as file_in:
-                with open(tmpKML, 'w') as file_out:
+            with open(kml, 'r', encoding=encoding) as file_in:
+                with open(tmpKML, 'w', encoding=encoding) as file_out:
                     for line in file_in:
                         if line.strip().startswith('<kml'):
                             if line.strip() != '<kml>':
