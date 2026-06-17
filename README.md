@@ -57,7 +57,7 @@ conda environment that provides the geospatial libraries, then install the wheel
 ```bat
 conda env create -f environment.yml
 conda activate tethys_rasters
-pip install https://github.com/JosePedroMatos/Tethys-meteoraster/raw/v2.4/dist/meteoraster-2.4-py3-none-any.whl
+pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.4/meteoraster-2.4-py3-none-any.whl
 ```
 
 > The wheel declares its pure-Python dependencies, but **GDAL is intentionally
