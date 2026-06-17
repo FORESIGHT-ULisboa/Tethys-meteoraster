@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meteoraster"
+version = "2.4"
+description = "Module for handling distributed ensemble and probabilistic forecast data (5-D meteorological rasters)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Jose Pedro Matos", email = "jose.matos@tecnico.ulisboa.pt" },
+]
+keywords = ["meteorology", "forecast", "ensemble", "raster", "netcdf", "ERA5", "GFS", "C3S", "CORDEX"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+# Pip-installable runtime dependencies.
+# NOTE: GDAL / `osgeo` is NOT listed here on purpose - it is a system/conda
+# dependency that pip cannot install reliably. Install it through the conda
+# environment (see environment.yml). The KML aggregation helpers
+# (get_values_from_KML / get_quantiles_from_KML) require it.
+dependencies = [
+    "numpy<2",
+    "scipy",
+    "pandas",
+    "xarray",
+    "netcdf4",
+    "h5netcdf",
+    "cfgrib",
+    "cdsapi",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    "statsmodels",
+    "cartopy",
+    "beautifulsoup4",
+    "openpyxl",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-cov"]
+build = ["build"]
+dev = ["pytest", "pytest-cov", "build", "jupyterlab"]
+
+[project.urls]
+Homepage = "https://github.com/JosePedroMatos/Tethys-meteoraster"
+Repository = "https://github.com/JosePedroMatos/Tethys-meteoraster"
+"FORESIGHT" = "https://foresight.tecnico.ulisboa.pt/"
+
+[tool.setuptools.packages.find]
+include = ["meteoraster*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# The "experimental" UserWarnings raised by some methods are intentional and noisy
+# in the test output, so they are ignored. DeprecationWarnings are intentionally
+# left visible so future numpy/pandas deprecations surface during testing.
+filterwarnings = [
+    "ignore::UserWarning",
+]

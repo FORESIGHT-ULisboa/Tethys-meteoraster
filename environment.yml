@@ -28,8 +28,11 @@ dependencies:
   - numpy<2
   - scipy
   - netcdf4
+  - h5netcdf
   - statsmodels
   - cartopy
+  - pytest
+  - pytest-cov
   - pip
   - pip:
     - BeautifulSoup4

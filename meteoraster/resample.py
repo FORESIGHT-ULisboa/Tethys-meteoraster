@@ -246,7 +246,7 @@ class Resample(object):
                 calculation_index = pd.date_range(start=date_from, end=date_to+leadtime_frequency, freq=calculation_frequency, inclusive='left')
                  
                 idx_map = idx_map.reindex(calculation_index, axis=0)
-                valid = idx_map.iloc[0, :]*np.NaN
+                valid = idx_map.iloc[0, :]*np.nan
                 shift = 1
                 for r0 in range(0, idx_map.shape[0]):
                     if np.isfinite(idx_map.iloc[r0, :]).any():

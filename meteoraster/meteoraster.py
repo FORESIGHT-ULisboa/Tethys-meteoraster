@@ -22,7 +22,14 @@ import cartopy.io.shapereader as shpreader
 class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
-    
+
+    v2.4:
+        Packaging modernized (pyproject.toml, optional dependencies, h5netcdf and
+        pytest declared as dependencies).
+        Cleaned up deprecated numpy/pandas idioms (np.NaN -> np.nan,
+        np.product -> np.prod, removed redundant axis= arguments) for
+        forward-compatibility with numpy 2 and pandas 3.
+
     v2.3:
         Fixed a bug in the groupByMatrix function where the coverage was not updated to reflect missing data, which could lead to incorrect aggregations. The coverage is now set to 0 for pixels where data is not valid before performing the aggregation.
 
@@ -40,7 +47,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '2.3'
+    VERSION = '2.4'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
 
@@ -221,7 +228,7 @@ class MeteoRaster(object):
         # Select specific leadtime columns (level 0 is leadtime)
         data = data.xs(leadtime, level='leadtime', axis=1)
 
-        tmp = data.rolling(window=window, center=True, axis=0).mean().dropna().stack().to_frame(name='values').reset_index()
+        tmp = data.rolling(window=window, center=True).mean().dropna().stack().to_frame(name='values').reset_index()
         
         # Use proper column name from index
         idx_name = data.index.name if data.index.name else 'index'
@@ -377,7 +384,7 @@ class MeteoRaster(object):
             else:
                 warnings.warn(warningMessage)
             shape = newData.shape
-            data = np.empty([shape[0], e0] + list(shape[2:])) * np.NaN
+            data = np.empty([shape[0], e0] + list(shape[2:])) * np.nan
             data[:, :e1, :, :, :] = newData
             newData = data
         elif e0<e1:
@@ -386,7 +393,7 @@ class MeteoRaster(object):
             else:
                 warnings.warn(warningMessage)
             shape = self.data.shape
-            data = np.empty([shape[0], e1] + list(shape[2:])) * np.NaN
+            data = np.empty([shape[0], e1] + list(shape[2:])) * np.nan
             data[:, :e0, :, :, :] = self.data
             self.data = data
 
@@ -463,7 +470,7 @@ class MeteoRaster(object):
         validPeriods =  periodDefinition[period][:idxs.max()+1]
         
         tmp = list(self.data.shape)
-        data = np.empty(tmp[:2] + [validPeriods.size] + tmp[-2:]) * np.NaN
+        data = np.empty(tmp[:2] + [validPeriods.size] + tmp[-2:]) * np.nan
         
         for i0 in idxs:
             dataForLeadtime = self.data[:, :, idxs==i0, :, :]
@@ -473,7 +480,7 @@ class MeteoRaster(object):
                 warnings.warn('Overlapping information detected when adjusting lead times (%s).' % str(validPeriods[i0]))
             
             tmp = np.nanmean(dataForLeadtime, axis=2)
-            tmp[count==0] = np.NaN
+            tmp[count==0] = np.nan
     
             if np.isnan(tmp).all():
                 warnings.warn('Unused Lead time (%s)' % str(validPeriods[i0]))
@@ -557,7 +564,7 @@ class MeteoRaster(object):
         else:
             virtualLevels = pd.to_datetime(self.production_datetime[0]) + self.leadtimes
             available.index = available.index.set_levels(virtualLevels, level=0)
-            tmp = available.groupby(axis=0, level=0).sum().transpose().stack().to_frame()
+            tmp = available.groupby(level=0).sum().transpose().stack().to_frame()
             tmp.index = tmp.index.set_levels(self.leadtimes, level=1)
 
         
@@ -603,7 +610,7 @@ class MeteoRaster(object):
         tmp = pd.DataFrame(np.arange(self.production_datetime.shape[0]), index=self.production_datetime)
         idxMax = tmp.resample(rule=rule).max().astype(int)+1
         
-        resampled = np.empty([idxMax.shape[0]] + list(self.data.shape[1:])) * np.NaN
+        resampled = np.empty([idxMax.shape[0]] + list(self.data.shape[1:])) * np.nan
         idx0 = 0
         for i0, i1 in enumerate(idxMax.values.ravel()):
             resampled[i0, :, :, :, :] = fun(self.data[idx0:i1, :, :, :, :], axis=0, keepdims=True)
@@ -916,7 +923,7 @@ class MeteoRaster(object):
         val = np.tile(np.expand_dims(val,-1), [1]*val.ndim + [coverage.shape[-1]])
 
         if elementwise:
-            agg = np.empty(list(self.data.shape[:3]) + [len(columns)]).astype(np.single) * np.NaN
+            agg = np.empty(list(self.data.shape[:3]) + [len(columns)]).astype(np.single) * np.nan
             
             data_single = self.data.astype(np.single)
             coverage_single = coverage.astype(np.single)
@@ -948,7 +955,7 @@ class MeteoRaster(object):
             gc.collect()
             
         #Mark invalid tiles as NaN
-        agg[~val] = np.NaN 
+        agg[~val] = np.nan 
         
         tmp = np.reshape(agg, (agg.shape[0], np.prod(agg.shape[1:])), order='F')
         agg = pd.DataFrame(tmp, index=self.production_datetime.ravel())
@@ -1020,7 +1027,7 @@ class MeteoRaster(object):
         agg = pd.DataFrame(tmp, index=time_idx)
         
         tmp = pd.concat([columns.to_frame()]*len(quantiles))
-        tmp.loc[:, 'Quantile'] = np.array([[q]*np.product(agg__.shape[1:-1]) for q in quantiles]).ravel()
+        tmp.loc[:, 'Quantile'] = np.array([[q]*np.prod(agg__.shape[1:-1]) for q in quantiles]).ravel()
         agg.columns = pd.MultiIndex.from_frame(tmp)
         agg.index.name = 'Production date'
         agg.sort_index(axis=1, inplace=True)
