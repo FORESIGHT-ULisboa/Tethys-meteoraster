@@ -1,9 +1,34 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import numpy as np
+import pandas as pd
 import pytest
+import xarray as xr
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from meteoraster import MeteoRaster
+
+RESOURCES = Path(__file__).resolve().parent / "resources"
+
+
+def read_gleam(file):
+    data = {}
+    with xr.open_dataset(file) as ds:
+        data['latitudes'] = ds.lat.data
+        data['longitudes'] = ds.lon.data
+        data['production_datetime'] = ds.time.data
+        data['leadtimes'] = np.array([pd.DateOffset(years=0)])
+        tmp = ds['E'][:, :, :].data
+        data['data'] = np.expand_dims(tmp, [1, 2])
+    return MeteoRaster(data, units='mm/year', variable='AET')
 
 def test_create_plot(sample_meteoraster):
     mr = sample_meteoraster
@@ -81,6 +106,31 @@ def test_plot_mean_projected(sample_meteoraster):
     except Exception as e:
         pytest.fail(f"plot_mean_projected raised an exception: {e}")
     plt.close()
+
+def test_gleam_read_and_plot():
+    gleam_file = RESOURCES / "E_2016_GLEAM_v4.2b_YR.nc"
+    aet = read_gleam(gleam_file)
+
+    assert aet is not None
+    assert aet.variable == 'AET'
+    assert aet.units == 'mm/year'
+
+    ax = aet.create_plot(central_longitude=20)
+    ax, cbar = aet.plot_mean(
+        ax=ax,
+        coastline=True,
+        borders=True,
+        colorbar=True,
+        cmap='viridis',
+        central_longitude=20,
+        central_latitude=0,
+        block=False,
+    )
+
+    assert ax is not None
+    assert cbar is not None
+    plt.close()
+
 
 def test_add_shapefile(sample_meteoraster, sample_shapefile):
     mr = sample_meteoraster

@@ -76,6 +76,12 @@ resamples a `DataFrame` whose columns carry a `leadtime` level. `resamplingType`
 - Version lives in **two** places that must be bumped together:
   `pyproject.toml` (`project.version`) and `MeteoRaster.VERSION`
   ([meteoraster.py](meteoraster/meteoraster.py)).
+  [.github/scripts/check_version.py](.github/scripts/check_version.py) enforces this
+  (plus tag agreement) before anything is published.
+- **Licensed Apache-2.0.** The license is declared as a PEP 639 SPDX expression
+  (`license = "Apache-2.0"` plus `license-files`), which is why `build-system.requires`
+  pins `setuptools>=77` and why there is **no** `License :: OSI Approved :: ...`
+  classifier — PyPI rejects metadata carrying both.
 
 ## Build / test / release
 
@@ -87,10 +93,35 @@ pytest -ra                                # run the suite
 python -m build                           # wheel + sdist into dist/
 ```
 
-Wheels and sdists are **committed** under [dist/](dist/) and installable from the
-GitHub raw URL (see [README.md](README.md)). After bumping the version and
-rebuilding, commit/push the new `dist/` artifacts (and tag, e.g. `v2.4`) for the
-documented install URL to resolve.
+`meteoraster` is published on **PyPI** (`pip install meteoraster`). Releases are cut
+by [.github/workflows/release.yml](.github/workflows/release.yml) on a `v*` tag push:
+it verifies the version declarations agree with the tag, builds, runs
+`twine check --strict`, publishes to PyPI, and attaches both artifacts to the GitHub
+release. A manual run from the Actions tab targets TestPyPI by default, for rehearsal.
+
+Releasing is therefore: bump the version in **both** places, commit, `git tag vX.Y`,
+`git push origin vX.Y`. Nothing is uploaded by hand. **PyPI versions are immutable** —
+a number can never be reused, even after deletion — so a failing version guard is a
+hard stop, not a nuisance.
+
+Historical wheels/sdists stay **committed** under [dist/](dist/) so previously
+documented URLs keep resolving. New releases no longer depend on that, and committing
+build output is optional going forward.
+
+### One-time PyPI setup (Trusted Publishing)
+
+Authentication is OIDC; no API tokens exist in the repository or in secrets. The
+publisher is registered once per index. Since the project is not on the index yet,
+it is registered as a **pending publisher**:
+
+- PyPI → *Publishing* → *Add a pending publisher* → GitHub
+- Owner `FORESIGHT-ULisboa`, repository `Tethys-meteoraster`
+- Workflow filename `release.yml`
+- Environment `pypi` (on TestPyPI: `testpypi`) — must match the `environment:` key in
+  the workflow job, or the OIDC exchange is rejected
+
+Create GitHub environments with those names under *Settings → Environments*. Adding a
+required reviewer there makes every publish an explicit approval gate.
 
 ## Known rough edges
 

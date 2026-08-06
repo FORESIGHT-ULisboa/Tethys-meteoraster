@@ -4,6 +4,12 @@
 
 # Tethys meteoraster
 
+<p align="center">
+  <a href="https://pypi.org/project/meteoraster/"><img src="https://img.shields.io/pypi/v/meteoraster.svg" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/meteoraster/"><img src="https://img.shields.io/pypi/pyversions/meteoraster.svg" alt="Supported Python versions"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+</p>
+
 **`meteoraster`** is a Python library, developed by [FORESIGHT — Forecasting and
 Optimization for Resilient Environmental Systems through Investigation with
 Groundbreaking Hydrological Tools](https://foresight.tecnico.ulisboa.pt/), for
@@ -45,25 +51,36 @@ report-ready time series, maps and aggregated statistics:
 ## Installation
 
 `meteoraster` relies on a geospatial stack (**GDAL/`osgeo`**, `cartopy`, `cfgrib`)
-that is most reliably installed with **conda**. Two paths follow: install a
-**released wheel** on top of a conda environment (use the package), or install
-**from source** (develop / run the tests).
+that is most reliably installed with **conda**. Two paths follow: install the
+**released package from PyPI** on top of a conda environment (use the package), or
+install **from source** (develop / run the tests).
 
-### A · Install a released wheel from GitHub
+### A · Install from PyPI
 
-The wheels are committed to the repository under [`dist/`](dist/). First create a
-conda environment that provides the geospatial libraries, then install the wheel:
+Create a conda environment that provides the geospatial libraries, then install
+[`meteoraster`](https://pypi.org/project/meteoraster/) into it:
 
 ```bat
 conda env create -f environment.yml
 conda activate tethys_rasters
-pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.4/meteoraster-2.4-py3-none-any.whl
+pip install meteoraster
 ```
 
-> The wheel declares its pure-Python dependencies, but **GDAL is intentionally
+Upgrading later needs no URL — `pip install --upgrade meteoraster` always picks up
+the newest release.
+
+> The package declares its pure-Python dependencies, but **GDAL is intentionally
 > not** a pip dependency (it is a system/conda package). The conda environment
 > above provides it. If you only need the point/plotting features and already
-> have GDAL, you can `pip install` the wheel into any environment.
+> have GDAL, you can `pip install meteoraster` into any environment.
+
+Every release is also attached to the
+[GitHub releases page](https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases),
+which is useful to pin an exact build without going through PyPI:
+
+```bat
+pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.4/meteoraster-2.4-py3-none-any.whl
+```
 
 ### B · Install from source (development)
 
@@ -82,8 +99,8 @@ From the repository root:
 pip install -e ".[dev]"
 ```
 
-That adds `pytest`, `pytest-cov`, `build` and `jupyterlab` on top of the runtime
-dependencies.
+That adds `pytest`, `pytest-cov`, `build`, `twine` and `jupyterlab` on top of the
+runtime dependencies.
 
 ---
 
@@ -185,7 +202,10 @@ Tethys-meteoraster/
 ├── AGENTS.md                  # canonical guidance for humans & AI agents
 ├── CLAUDE.md                  # → points to AGENTS.md
 ├── .github/copilot-instructions.md  # → points to AGENTS.md
+├── .github/workflows/release.yml    # build + publish to PyPI on tag push
+├── .github/scripts/check_version.py # release guard: version declared consistently
 ├── LICENSE                    # Apache 2.0
+├── NOTICE                     # attribution required by Apache 2.0
 └── README.md
 ```
 
@@ -234,9 +254,43 @@ pip install dist/meteoraster-2.4-py3-none-any.whl
 Notes:
 - The version lives in [pyproject.toml](pyproject.toml) (`project.version`) and is
   mirrored in `MeteoRaster.VERSION` — bump both together.
-- The GitHub wheel URL in [Installation](#a--install-a-released-wheel-from-github)
-  resolves once the new `dist/` artifacts are **committed and pushed** (and the
-  `v2.4` tag created).
+  [.github/scripts/check_version.py](.github/scripts/check_version.py) enforces
+  that at release time.
+- Building by hand is only needed to inspect an artifact locally. Actual releases
+  are produced by CI — see [Releasing](#releasing) below.
+
+---
+
+## Releasing
+
+Releases are automated by
+[.github/workflows/release.yml](.github/workflows/release.yml). To cut version
+`X.Y`:
+
+1. Bump the version in **both** [pyproject.toml](pyproject.toml) and
+   `MeteoRaster.VERSION`, then commit.
+2. Tag and push:
+
+   ```bat
+   git tag vX.Y
+   git push origin vX.Y
+   ```
+
+The workflow then verifies the two version declarations agree with the tag, builds
+the wheel and sdist, runs `twine check --strict`, publishes to
+[PyPI](https://pypi.org/project/meteoraster/), and attaches both artifacts to the
+GitHub release.
+
+To rehearse without touching PyPI, run the workflow manually from the **Actions**
+tab and leave the target as `testpypi`; it builds and uploads to
+[TestPyPI](https://test.pypi.org/project/meteoraster/) with no tag required.
+
+> **PyPI uploads are immutable** — a version number can never be reused, even
+> after deletion. Get the version right before pushing the tag.
+
+Authentication uses [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+(OIDC), so no API tokens are stored in the repository. The one-time setup is
+described in [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -309,4 +363,6 @@ Notes:
 ---
 
 ## License
-See [LICENSE](LICENSE).
+
+Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) and
+[NOTICE](NOTICE).
