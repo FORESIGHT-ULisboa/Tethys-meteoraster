@@ -23,6 +23,14 @@ class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
 
+    v2.5:
+        Published on PyPI - installs with `pip install meteoraster`. Releases are
+        built and uploaded automatically on tag push (GitHub Actions + PyPI
+        Trusted Publishing), and attached to the GitHub release.
+        Licensing made consistent: the LICENSE file carried GPL-3 text while the
+        package metadata declared Apache-2.0. Apache-2.0 is now the license
+        everywhere, declared as a PEP 639 SPDX expression, with a NOTICE file.
+
     v2.4:
         Packaging modernized (pyproject.toml, optional dependencies, h5netcdf and
         pytest declared as dependencies).
@@ -47,7 +55,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '2.4'
+    VERSION = '2.5'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
 

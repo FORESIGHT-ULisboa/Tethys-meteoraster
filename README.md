@@ -79,7 +79,7 @@ Every release is also attached to the
 which is useful to pin an exact build without going through PyPI:
 
 ```bat
-pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.4/meteoraster-2.4-py3-none-any.whl
+pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.5/meteoraster-2.5-py3-none-any.whl
 ```
 
 ### B · Install from source (development)
@@ -196,7 +196,6 @@ Tethys-meteoraster/
 │   └── utils.py               # ERA5 / ERA5-Land / GFS / C3S / CORDEX readers
 ├── tests/                     # pytest suite + fixtures (conftest.py)
 ├── images/foresight.png       # README header
-├── dist/                      # built wheels + sdists (committed)
 ├── environment.yml            # conda environment (tethys_rasters)
 ├── pyproject.toml             # packaging + pytest configuration
 ├── AGENTS.md                  # canonical guidance for humans & AI agents
@@ -241,14 +240,14 @@ This produces both artifacts in `dist/`:
 
 ```
 dist/
-├── meteoraster-2.4-py3-none-any.whl
-└── meteoraster-2.4.tar.gz
+├── meteoraster-2.5-py3-none-any.whl
+└── meteoraster-2.5.tar.gz
 ```
 
 Install the wheel anywhere (provided GDAL is available):
 
 ```bat
-pip install dist/meteoraster-2.4-py3-none-any.whl
+pip install dist/meteoraster-2.5-py3-none-any.whl
 ```
 
 Notes:

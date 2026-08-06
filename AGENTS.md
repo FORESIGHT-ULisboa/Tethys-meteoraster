@@ -104,9 +104,11 @@ Releasing is therefore: bump the version in **both** places, commit, `git tag vX
 a number can never be reused, even after deletion — so a failing version guard is a
 hard stop, not a nuisance.
 
-Historical wheels/sdists stay **committed** under [dist/](dist/) so previously
-documented URLs keep resolving. New releases no longer depend on that, and committing
-build output is optional going forward.
+Build output is **not** committed: `dist/` (local builds) and `dist-release/` (what CI
+builds and publishes) are both gitignored. Wheels for v2.0–v2.4 were committed under
+`dist/` historically; they remain attached to their GitHub releases, and the artifacts
+that only ever lived in `dist/` (the 0.1/0.2 wheels and the pre-2.5 sdists) are still
+reachable through the tags, e.g. `raw/v2.4/dist/meteoraster-2.4.tar.gz`.
 
 ### One-time PyPI setup (Trusted Publishing)
 
