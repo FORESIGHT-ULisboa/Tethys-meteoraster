@@ -5,12 +5,13 @@ name: Release
 #
 # Authentication is PyPI Trusted Publishing (OIDC): no API tokens are stored.
 # The `pypi` / `testpypi` environment names below must match what is registered
-# as the publisher on each index. See AGENTS.md for the one-time setup.
+# as the publisher on each index. See the "One-time setup" section of README.md.
 #
-# Artifacts are built into `dist-release/`, NOT `dist/`: this repository commits
-# historical wheels under `dist/`, and those predate `long_description`, so a
-# `twine check --strict dist/*` would fail on them. Building elsewhere keeps the
-# check and the upload scoped to what this run actually produced.
+# Artifacts are built into `dist-release/`, NOT `dist/`, so the check and the
+# upload can only ever see what this run produced - never a stray local build or
+# a historical artifact restored from an older ref (wheels for v2.0-v2.4 were
+# committed under `dist/` and predate `long_description`, which made a
+# `twine check --strict dist/*` fail).
 
 on:
   push:

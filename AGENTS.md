@@ -112,18 +112,17 @@ reachable through the tags, e.g. `raw/v2.4/dist/meteoraster-2.4.tar.gz`.
 
 ### One-time PyPI setup (Trusted Publishing)
 
-Authentication is OIDC; no API tokens exist in the repository or in secrets. The
-publisher is registered once per index. Since the project is not on the index yet,
-it is registered as a **pending publisher**:
+Authentication is OIDC; **no API tokens exist in the repository or in secrets, and
+none should be added** — see [README.md](README.md#one-time-setup-maintainers) for the
+registration steps and the reasoning. Two constraints matter when touching the
+workflow:
 
-- PyPI → *Publishing* → *Add a pending publisher* → GitHub
-- Owner `FORESIGHT-ULisboa`, repository `Tethys-meteoraster`
-- Workflow filename `release.yml`
-- Environment `pypi` (on TestPyPI: `testpypi`) — must match the `environment:` key in
-  the workflow job, or the OIDC exchange is rejected
-
-Create GitHub environments with those names under *Settings → Environments*. Adding a
-required reviewer there makes every publish an explicit approval gate.
+- The environment names (`pypi` / `testpypi`) are part of what PyPI verifies. Renaming
+  a job's `environment:` key without re-registering the publisher breaks the OIDC
+  exchange.
+- `id-token: write` belongs only to the publish jobs. The build job stays
+  `contents: read`, so the job that produces artifacts never holds the identity that
+  can upload them.
 
 ## Known rough edges
 

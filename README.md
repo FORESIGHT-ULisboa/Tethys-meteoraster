@@ -287,9 +287,53 @@ tab and leave the target as `testpypi`; it builds and uploads to
 > **PyPI uploads are immutable** — a version number can never be reused, even
 > after deletion. Get the version right before pushing the tag.
 
-Authentication uses [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
-(OIDC), so no API tokens are stored in the repository. The one-time setup is
-described in [AGENTS.md](AGENTS.md).
+### One-time setup (maintainers)
+
+Publishing is authenticated with
+[PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC):
+GitHub mints a short-lived credential at publish time that PyPI accepts only for
+this repository, this workflow file and this environment. **No API token is
+created, stored or pasted anywhere.** Every value below is a public fact about
+the repository — none of it is a secret, which is precisely the point.
+
+**On PyPI** — once per index (repeat on [TestPyPI](https://test.pypi.org/) if you
+want the rehearsal path):
+
+1. *Your account → Publishing → Add a pending publisher* → GitHub, and fill in:
+
+   | Field | Value |
+   |---|---|
+   | PyPI project name | `meteoraster` |
+   | Owner | `FORESIGHT-ULisboa` |
+   | Repository | `Tethys-meteoraster` |
+   | Workflow name | `release.yml` |
+   | Environment | `pypi` (on TestPyPI: `testpypi`) |
+
+   The environment name must match the `environment:` key of the corresponding
+   job in [release.yml](.github/workflows/release.yml), or PyPI rejects the
+   exchange. A *pending* publisher is what you register before the project exists
+   on an index; it turns into an ordinary one on the first successful upload.
+
+**On GitHub** — once:
+
+2. *Settings → Environments* → create `pypi` (and `testpypi`).
+3. Add a **required reviewer** to `pypi`. Every publish then pauses for an
+   explicit approval, so a tag push alone cannot ship a release.
+
+Things worth keeping that way:
+
+- **Do not add a PyPI API token to repository secrets.** Trusted Publishing
+  exists to remove that long-lived credential; a token in secrets is usable by
+  any workflow in the repository and stays valid until someone revokes it.
+  Nothing here needs one.
+- The publisher trusts the workflow **by filename**, so anyone able to change
+  [release.yml](.github/workflows/release.yml) or push a `v*` tag can trigger a
+  publish. Protect `main` and restrict who may push tags; the environment
+  reviewer from step 3 is the backstop.
+- Only the two publish jobs request `id-token: write`; the build job is
+  `contents: read` and the workflow default is `permissions: {}`. Keep that split
+  when editing it — the job that produces the artifacts never holds the identity
+  that can upload them.
 
 ---
 
