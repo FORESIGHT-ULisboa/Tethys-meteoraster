@@ -38,6 +38,14 @@ jobs:
   test:
     name: Test suite
     uses: ./.github/workflows/tests.yml
+    # A reusable workflow can only maintain or reduce the caller's permissions, and
+    # `permissions: {}` above gives this job none. The nested jobs ask for
+    # `contents: read` to check out the repository, so the call is rejected outright
+    # ("is requesting 'contents: read', but is only allowed 'contents: none'") unless
+    # that read is granted here. Nothing more is needed: the publish jobs hold
+    # `id-token: write` on their own.
+    permissions:
+      contents: read
 
   build:
     name: Build and check distributions
