@@ -6,6 +6,10 @@ import pytest
 
 from meteoraster import Resample
 
+# The Resample v2.0 rewrite removed the pandas-1.x idioms these two cases used to
+# fail on, so the xfail that stood here is gone. tests/test_resample_semantics.py
+# covers the contract in detail; this file keeps the smoke tests.
+
 
 def _daily_single_leadtime_frame(n=10):
     """A production x leadtime frame: daily production dates, a single 0-day leadtime."""

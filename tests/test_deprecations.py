@@ -23,7 +23,21 @@ def test_get_values_from_latlon_alias_warns(sample_meteoraster):
 
 
 def test_get_values_from_kml_alias_warns(sample_meteoraster, sample_kml):
+    pytest.importorskip('osgeo')
+
     mr = sample_meteoraster
     with pytest.warns(DeprecationWarning):
         agg, centroids = mr.getValuesFromKML(kml=str(sample_kml), nameField="zone_id")
     assert "ZoneA" in agg.columns.get_level_values("zone")
+
+
+def test_get_quantiles_from_kml_alias_warns(grid_raster, grid_kml):
+    pytest.importorskip('osgeo')
+
+    with pytest.warns(DeprecationWarning):
+        agg, centroids = grid_raster.getQuantilesFromKML(kml=str(grid_kml),
+                                                         nameField='zone_id',
+                                                         quantiles=[0.5])
+
+    assert 'whole' in agg.columns.get_level_values('zone')
+    assert 'whole' in centroids.index

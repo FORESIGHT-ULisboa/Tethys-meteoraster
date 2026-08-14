@@ -186,6 +186,10 @@ def test_greenwich_fix():
     assert mr.longitudes[0, 1] == 179
 
 def test_get_values_from_kml(sample_meteoraster, sample_kml):
+    pytest.importorskip('osgeo')
+    # Since v3.0 this runs on meteoraster.zonal, which needs no scipy - so the
+    # LinearNDInterpolator crash guard this test used to carry is gone with it.
+
     mr = sample_meteoraster
     # The fixture MR roughly covers Lat [30, 40], Lon [-10, 10]
     # KML polygon covers [-2, 2] x [32, 38] which is inside.
@@ -213,5 +217,57 @@ def test_get_values_from_kml(sample_meteoraster, sample_kml):
     # Centroid should be around 0, 35
     assert np.isclose(float(centroids.loc["ZoneA", "x"]), 0.0, atol=1.0)
     assert np.isclose(float(centroids.loc["ZoneA", "y"]), 35.0, atol=1.0)
+
+
+def test_get_values_from_kml_covers_the_grid_border(grid_raster, grid_kml):
+    '''
+    The on-paper answer. grid_raster is 10 everywhere except a 1 in the centre cell of
+    a 3x3 grid of unit cells, so the area-weighted mean over the whole grid is 9.0.
+
+    The legacy builder clipped its candidates to 0 < i < n-1, so it saw only the centre
+    cell and returned 1.0 - plausible-looking, because the weights were renormalised by
+    the area it did find. v3.0 runs on meteoraster.zonal and gets 9.0.
+    '''
+
+    pytest.importorskip('osgeo')
+
+    agg, centroids = grid_raster.get_values_from_KML(kml=str(grid_kml), nameField='zone_id')
+
+    whole = agg.xs('whole', axis=1, level='zone')
+    middle = agg.xs('middle', axis=1, level='zone')
+
+    # leadtime k scales the field by k+1, and every member holds the same field
+    for leadtime, factor in zip(sorted(set(whole.columns.get_level_values('leadtime'))),
+                                (1, 2, 3)):
+        assert np.allclose(whole.xs(leadtime, axis=1, level='leadtime').to_numpy(),
+                           9.0 * factor)
+        assert np.allclose(middle.xs(leadtime, axis=1, level='leadtime').to_numpy(),
+                           1.0 * factor)
+
+    assert list(agg.columns.names) == ['zone', 'leadtime', 'ensemble_member']
+    # 0-based, matching get_values_from_latlon and get_quantiles_from_KML
+    assert sorted(set(agg.columns.get_level_values('ensemble_member'))) == [0, 1]
+    assert np.isclose(float(centroids.loc['middle', 'x']), 1.0)
+    assert np.isclose(float(centroids.loc['middle', 'y']), 1.0)
+
+
+def test_get_values_from_kml_reuses_a_coverage(grid_raster, grid_kml):
+    pytest.importorskip('osgeo')
+
+    first, _, coverage_info = grid_raster.get_values_from_KML(
+        kml=str(grid_kml), nameField='zone_id', getCoverageInfo=True)
+    again, _ = grid_raster.get_values_from_KML(kml=str(grid_kml), coverage_info=coverage_info)
+
+    assert np.allclose(first.to_numpy(), again.to_numpy(), equal_nan=True)
+
+
+def test_get_values_from_kml_ignores_elementwise(grid_raster, grid_kml):
+    '''`elementwise` only skipped the missing-data renormalisation, which is now always on.'''
+
+    pytest.importorskip('osgeo')
+
+    with pytest.warns(DeprecationWarning, match='elementwise'):
+        grid_raster.get_values_from_KML(kml=str(grid_kml), nameField='zone_id',
+                                        elementwise=True)
 
 

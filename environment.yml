@@ -13,6 +13,16 @@
 #conda env export > "climatechange_real.yml"
 
 
+# Note on BLAS: a solve that lands on MKL 2026.x has been seen to produce an env
+# where numpy's linear algebra crashes the interpreter outright - no traceback,
+# "Windows fatal exception: code 0xc06d007f" - the first time numpy.linalg or scipy's
+# LinearNDInterpolator is evaluated, which kills a whole pytest session. If that
+# happens, switch the env to OpenBLAS:
+#
+#   conda install -n tethys_rasters -c conda-forge "libblas=*=*openblas"
+#
+# It is not pinned here because MKL is normally the faster choice.
+
 name: tethys_rasters
 channels:
   - conda-forge
@@ -25,10 +35,13 @@ dependencies:
   - scikit-learn
   - pandas
   - matplotlib
-  - numpy<2
+  - numpy>=1.26
   - scipy
   - netcdf4
   - h5netcdf
+  # h5netcdf >=1.6 has pluggable backends and no longer requires h5py, so it
+  # must be declared explicitly or save()/load() fail at open time.
+  - h5py
   - statsmodels
   - cartopy
   - pytest

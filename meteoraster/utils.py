@@ -1,159 +1,157 @@
 '''
+Readers for ERA5-Land GRIB, returning a ready MeteoRaster.
+
 Created on 10/02/2023
 
 @author: Jose Pedro Matos
+
+v3.0 removed readERA5_monthly, read_GFS, read_C3S and readCORDEX_monthly. Every
+reader here used to populate data['productionDates'] while MeteoRaster.__init__
+reads data['production_datetime'], so all six raised KeyError; only the two
+ERA5-Land readers were worth keeping alive.
+
+cfgrib needs the ecCodes binary. On Windows it lives in <env>/Library/bin and is
+only found through PATH, so the conda environment must be activated - calling its
+python.exe directly raises RuntimeError('Cannot find the ecCodes library').
 '''
 
 import warnings
 import numpy as np
 import xarray as xr
 import pandas as pd
-from pathlib import Path
-from collections.abc import Iterable
 from meteoraster import MeteoRaster
 
-def readERA5_monthly(file, variable, **kwargs):
-    '''
-    Return a dict:
-        data: 5-D numpy array [productionDate, ensembleMember, leadtime, latitude, longitude]
-        production dates: 1-D numpy array
-        leadtimes: 1-D numpy array
-        latitudes: 1-D numpy array
-        longitudes: 1-D numpy array
-    '''
-    
-    data = {}
-    with xr.open_dataset(file, engine='cfgrib', indexpath='', **kwargs) as ds:
-        data['latitudes'] = ds.latitude.data
-        data['longitudes'] = ds.longitude.data
-        data['productionDates'] = pd.to_datetime(ds.time.data)
-        tmp = ds[variable][:, :, :].data
-        data['data'] = np.expand_dims(tmp, [1, 2])
-        data['leadtimes'] = np.array([pd.DateOffset(days=0)])
+#: variable -> units after the conversions below.
+_MONTHLY_UNITS = {'tp': 'mm/month', 't2m': 'C', 'ro': 'mm/month', 'e': 'mm/month'}
 
-    
-    if variable == 'tp':
-        data['data'] *= 1000 #to mm/day
-        days_in_month = data['productionDates'].days_in_month        
-        days_in_month = np.expand_dims(days_in_month, (1, 2, 3, 4))
-        days_in_month = np.tile(days_in_month, [1] + list(data['data'].shape[1:]))
-        data['data'] *= days_in_month
-        units = 'mm/month'
-    elif variable == 't2m':
-        data['data'] -= 273.15
-        units = 'C'
-    elif variable == 'ro':
-        data['data'] *= 1000
-        units = 'mm/month'
-    elif variable == 'e':
-        data['data'] *= 1000
-        units = 'mm/month'
-    
-    tmp = MeteoRaster(data, variable=variable, units=units)
-    return tmp
-    
+#: variable -> GRIB shortName. A single monthly file holds several variables with
+#: *different* stepTypes ('avgid' for 2t, 'avgas' for tp), so cfgrib cannot build one
+#: hypercube from it and each read needs a filter. Filtering on stepType instead is
+#: what broke: the value hard-coded here was 'avgad', and CDS now delivers 'avgas'.
+_MONTHLY_SHORT_NAMES = {'tp': 'tp', 't2m': '2t', 'ro': 'ro', 'e': 'e'}
+
+#: Variables stored as an accumulation since 00 UTC rather than an instantaneous value.
+_CUMULATIVE = {'tp': True, 'ssr': True, 'u10': False, 'v10': False, 'sd': False,
+               't2m': False}
+
+
 def readERA5Land_monthly(file, variable, **kwargs):
     '''
-    Return a dict:
-        data: 5-D numpy array [productionDate, ensembleMember, leadtime, latitude, longitude]
-        production dates: 1-D numpy array
-        leadtimes: 1-D numpy array
-        latitudes: 1-D numpy array
-        longitudes: 1-D numpy array
+    Reads ERA5-Land monthly means.
 
-        https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land-monthly-means?tab=overview
-        
-        t2m: temperature
-        tp: total precipitation
-        ...
+    https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land-monthly-means
+
+    variable:
+        t2m - 2 m temperature      -> C
+        tp  - total precipitation  -> mm/month
+        ro, e                      -> mm/month
     '''
-    
-    if variable=='tp':
-        if 'backend_kwargs' in kwargs.keys():
-            kwargs['backend_kwargs'].update({'filter_by_keys': {'shortName': 'tp', 'stepType': 'avgad'}})
-        else:
-            kwargs['backend_kwargs'] = {'filter_by_keys': {'shortName': 'tp', 'stepType': 'avgad'}}
-    
+
+    if variable not in _MONTHLY_UNITS:
+        raise Exception(f'How to handle variable "{variable}" must be defined.')
+
+    backend_kwargs = dict(kwargs.pop('backend_kwargs', {}))
+    filter_by_keys = dict(backend_kwargs.pop('filter_by_keys', {}))
+    filter_by_keys.setdefault('shortName', _MONTHLY_SHORT_NAMES[variable])
+    backend_kwargs['filter_by_keys'] = filter_by_keys
+
     data = {}
-    with xr.open_dataset(file, engine='cfgrib', indexpath='', **kwargs) as ds:
+    with xr.open_dataset(file, engine='cfgrib', indexpath='',
+                         backend_kwargs=backend_kwargs, **kwargs) as ds:
+        names = list(ds.data_vars)
+        if len(names) != 1:
+            raise Exception('Expected one variable for shortName "%s"; got %s. Narrow '
+                            'the read with backend_kwargs={"filter_by_keys": ...}.'
+                            % (filter_by_keys['shortName'], names))
+
         data['latitudes'] = ds.latitude.data
         data['longitudes'] = ds.longitude.data
-        data['productionDates'] = pd.to_datetime(ds.time.data)
-        tmp = ds[variable][:, :, :].data
-        data['data'] = np.expand_dims(tmp, [1, 2])
-        data['leadtimes'] = np.array([pd.DateOffset(days=0)])
+        # A single month collapses the time dimension to a scalar coordinate, which
+        # used to make ds[variable][:, :, :] raise and days_in_month return an int.
+        production_datetime = pd.DatetimeIndex(np.atleast_1d(pd.to_datetime(ds.time.data)))
+        data['production_datetime'] = production_datetime
 
-    
-    if variable == 'tp':
-        data['data'] *= 1000 #to mm/day
-        days_in_month = data['productionDates'].days_in_month        
-        days_in_month = np.expand_dims(days_in_month, (1, 2, 3, 4))
-        days_in_month = np.tile(days_in_month, [1] + list(data['data'].shape[1:]))
-        data['data'] *= days_in_month
-        units = 'mm/month'
-    elif variable == 't2m':
+        values = np.asarray(ds[names[0]].data, dtype=float)
+        if values.ndim == 2:
+            values = values[np.newaxis]
+        data['data'] = np.expand_dims(values, [1, 2])
+
+    data['leadtimes'] = np.array([pd.DateOffset(days=0)])
+
+    if variable == 't2m':
         data['data'] -= 273.15
-        units = 'C'
-    elif variable == 'ro':
-        data['data'] *= 1000
-        units = 'mm/month'
-    elif variable == 'e':
-        data['data'] *= 1000
-        units = 'mm/month'
     else:
-        raise(Exception(f'How to handle variable "{variable}" must be defined.'))
-    
-    tmp = MeteoRaster(data, variable=variable, units=units)
-    return tmp
+        data['data'] *= 1000                                  # m -> mm
+        if variable == 'tp':
+            # tp is a mean daily accumulation, so a month's total scales with its
+            # length. Broadcast rather than tile: tiling this to a global 0.1 deg
+            # grid allocates a second full-size array.
+            days = production_datetime.days_in_month.to_numpy(dtype=float)
+            data['data'] *= days.reshape(-1, 1, 1, 1, 1)
+
+    return MeteoRaster(data, variable=variable, units=_MONTHLY_UNITS[variable])
+
+
+def _read_ERA5Land_helper(file, variable):
+    '''
+    Reads the GRIB and normalises it to [date, step, y, x].
+
+    cfgrib drops a length-1 dimension to a scalar coordinate, so which axis a 3-D
+    array is missing depends on the request; the step count disambiguates it.
+    '''
+
+    data = {}
+    with xr.open_dataset(file, engine='cfgrib', indexpath='') as ds:
+        data['latitudes'] = ds.latitude.data
+        data['longitudes'] = ds.longitude.data
+        data['production_datetime'] = np.atleast_1d(ds.time.data)
+        data['steps'] = np.atleast_1d(ds.step.data)
+        values = ds[variable].data
+
+    if values.ndim == 3:
+        values = values[:, np.newaxis] if data['steps'].size == 1 else values[np.newaxis]
+    data['data'] = values
+
+    return data
+
 
 def read_ERA5Land_hourly(file, variable, file_next_year=None):
     '''
-    Returns a MeteoRaster object with the ERA5 Land data
-    '''
-    
-    cumulative = {'tp': True, 'ssr': True, 'u10': False, 'v10': False, 'sd': False, 't2m': False}
-    
-    def _read_ERA5Land_helper(file, variable):
-        '''
-        Just reads the grib file
-        '''
-        
-        data = {}
-        with xr.open_dataset(file, engine='cfgrib', indexpath='') as ds:
-            data['latitudes'] = ds.latitude.data
-            data['longitudes'] = ds.longitude.data
-            data['productionDates'] = ds.time.data
-            if isinstance(data['productionDates'], np.datetime64):
-                data['productionDates'] = np.array([data['productionDates']])
-            data['data'] = ds[variable][:, :, :].data
-            data['steps'] = ds.step.data
-            
-            return data
-        
-    data = _read_ERA5Land_helper(file, variable)
-    
-    if cumulative[variable]:
-        first_timestamp = pd.Timestamp(data['productionDates'][0])
-        last_timestamp = pd.Timestamp(data['productionDates'][-1])
-        if first_timestamp==pd.Timestamp(first_timestamp.year, 12, 31) and np.isnan(data['data'][0, -2, :, :]).min():
-            # Last day of the previous year with data on the last hour only... To remove.
-            data['data'] = data['data'][1:, :, :, :]
-            data['productionDates'] = data['productionDates'][1:]
-            warnings.warn('Last hour of the previous year dropped...')
+    Reads ERA5-Land hourly data, returning one production stamp per hour.
 
-        if last_timestamp==pd.Timestamp(last_timestamp.year, 12, 31) and np.isnan(data['data'][-1, -1, :, :]).max():
-            if file_next_year is not None:
-                # Last day of the previous year with data missing on the last hour... To lead next year and take that value
-                data_last = _read_ERA5Land_helper(file_next_year, variable)
-                data['data'][-1, -1, :, :] = data_last['data'][0, -1, :, :]
-                warnings.warn('First hour of the following year added...')
-            
-        if len(data['data'].shape)==4:
-            # (date, hour, ...) > (timestamp, ---)
-            data['data'] = np.diff(data['data'], n=1, axis=1, prepend=0)
-        else:
-            data['data'] = np.diff(data['data'], n=1, axis=0, prepend=0)
-    
+    Accumulations are de-accumulated to per-hour increments. A CDS request for one
+    period also returns the previous period's last hour (that date carrying its last
+    step only) and omits the last hour of its own last day, which is delivered with
+    the next period - pass that file as `file_next_year` to fill it in.
+
+    Every value describes [stamp, stamp + 1h), the library's forward convention, so an
+    accumulation at step s belongs at date + (s - s[0]). Instantaneous fields are valid
+    at cfgrib's valid_time, date + s - an hour later.
+    '''
+
+    if variable not in _CUMULATIVE:
+        raise Exception(f'How to handle variable "{variable}" must be defined.')
+
+    data = _read_ERA5Land_helper(file, variable)
+    steps = data['steps']
+
+    if _CUMULATIVE[variable]:
+        # Detected from the data rather than the calendar: these guards used to test
+        # for December 31 and so never fired on a month boundary.
+        if steps.size > 1:
+            first = data['data'][0]
+            if np.isnan(first[:-1]).all() and np.isfinite(first[-1]).any():
+                data['data'] = data['data'][1:]
+                data['production_datetime'] = data['production_datetime'][1:]
+                warnings.warn('Last hour of the previous period dropped...')
+
+            if np.isnan(data['data'][-1, -1]).all() and file_next_year is not None:
+                following = _read_ERA5Land_helper(file_next_year, variable)
+                data['data'][-1, -1] = following['data'][0, -1]
+                warnings.warn('First hour of the following period added...')
+
+        data['data'] = np.diff(data['data'], n=1, axis=1, prepend=0)
+
     if variable == 'tp':
         data['data'] *= 1000
         units = 'mm/hr'
@@ -161,199 +159,24 @@ def read_ERA5Land_hourly(file, variable, file_next_year=None):
         data['data'] -= 273.15
         units = 'C'
     elif variable == 'sd':
-        #=======================================================================
-        # raise Exception('Cumulative?')
-        #=======================================================================
         data['data'] *= 1000
         units = 'mm'
     elif variable == 'ssr':
         data['data'] /= 3600
         units = 'W/m2'
-    elif variable == 'u10' or variable == 'v10':
-        units = 'm/s'
-
-        #=======================================================================
-        # if variable == 'tp' or variable == 't2m':
-        #     tmp = np.reshape(tmp, (tmp.shape[0]*tmp.shape[1], tmp.shape[2], tmp.shape[3]))
-        #     times = np.tile(data['productionDates'], (24, 1)).transpose() + np.tile(ds.step.data, (data['productionDates'].shape[0], 1))
-        #     data['productionDates'] = times.ravel()
-        #=======================================================================
-        
-    if not isinstance(data['steps'], Iterable):
-        data['steps'] = [data['steps']]
-        
-    if variable !='sd':
-        data['data'] = np.reshape(data['data'], (data['data'].shape[0]*data['data'].shape[1], data['data'].shape[-2], data['data'].shape[-1]))
-    
-        times = np.tile(data['productionDates'], (24, 1)).transpose() + np.tile(data['steps'] - data['steps'][0], (data['productionDates'].shape[0], 1))
-        data['productionDates'] = times.ravel()
-    
-    data['data'] = np.expand_dims(data['data'], [1, 2])
-    data['leadtimes'] = np.array([pd.DateOffset(days=0)])
-            
-    tmp = MeteoRaster(data, units=units, variable=variable)
-    tmp.trim()
-    
-    return tmp
-
-def read_GFS(path, timestamp, leadtime, variable, crop=None):
-    '''
-        TMP
-        PRATE
-        WEASD
-        DPT
-        RH
-        SNOD
-        SUNSD
-        UGRD
-        VGRD
-    '''
-    
-    GFS_info = dict(TMP=dict(units='C', variable='t2m', transform=lambda x: x),
-                    PRATE=dict(units='mm/3h', variable='tp', transform=lambda x: x*3600*3),  # kg/(m^2 s) > mm/3h
-                    )
-    
-    lead_hours = leadtime // np.timedelta64(1, 'h')
-    
-    path_ = Path(path) / timestamp.strftime('%Y/%m') / '00' / ('%03u' % lead_hours)
-    file = path_ / 'gfs_4_{date:s}_00_{lead:03d}.nc'.format(date=timestamp.strftime('%Y.%m.%d'), lead=lead_hours)
-    
-    data = {}
-    with xr.open_dataset(file) as ds:
-        data['latitudes'] = ds.lat.data
-        data['longitudes'] = ds.lon.data
-        data['productionDates'] = ds.productionDatetimes.data
-        data['leadtimes'] = np.array([pd.Timedelta(hours=int(ds.leadtimes.data/1000000000/3600))])
-        tmp = ds[variable][:, :, :, :].data
-        data['data'] = np.expand_dims(tmp, [1])
-        
-        if GFS_info[variable]['transform']:
-            data['data'] = GFS_info[variable]['transform'](data['data'])
-    
-    meteoraster = MeteoRaster(data, units=GFS_info[variable]['units'], variable=GFS_info[variable]['variable'])
-    if crop:
-        meteoraster = meteoraster.getCropped(**crop)
-    
-    return meteoraster
-
-def read_C3S(file, variable, engine='cfgrib', **kwargs):
-    '''
-    Reads c3s forecasts (seasonal forecast monthly statistics on single levels)
-    https://cds.climate.copernicus.eu/datasets/seasonal-monthly-single-levels?tab=overview
-    
-    v0.1
-    2024.10.04
-    
-    Return a dict:
-    data: 5-D numpy array [productionDate, ensembleMember, leadtime, latitude, longitude]
-    production dates: 1-D numpy array
-    leadtimes: 1-D numpy array
-    latitudes: 1-D numpy array
-    longitudes: 1-D numpy array
-    '''
-
-    data = {}
-    with xr.open_dataset(file, engine=engine, indexpath='', **kwargs) as ds:
-        data['latitudes'] = ds.latitude.data
-        data['longitudes'] = ds.longitude.data
-        data['productionDates'] = ds.time.data
-        data_ = ds[variable][:, :, :, :].data
-        steps_ = pd.to_timedelta([pd.Timedelta(f'{d}d') for d in (ds.step.data/86400/1000000000).astype(int)])
-        
-    data_ = np.rollaxis(data_, 1, 0)
-        
-    months_ = np.round(steps_.days/30).astype(int)
-    months_unique = np.unique(months_)
-    data['leadtimes'] = [pd.DateOffset(months=m-1) for m in months_unique]
-    
-    data_shape = list(data_.shape)
-    data_shape[2] = len(months_unique)
-    data['data'] = np.empty(data_shape)*np.nan  
-    for i0, m0 in enumerate(months_unique):
-        idxs = months_==m0
-        data['data'][:, :, i0, :, :] = np.nanmean(data_[:, :, idxs, :, :], axis=2)
-        
-    if variable == 'tprate':
-        data['data'] *= 1000 # to mm/s
-        
-        idx = pd.MultiIndex.from_product([data['productionDates'], data['leadtimes']],
-                                         names=['productionDates', 'leadtimes']).to_frame()
-        days_in_month = idx.sum(axis=1).dt.days_in_month.unstack('leadtimes')
-        seconds_in_month = days_in_month*86400
-        
-        multiplier = np.expand_dims(seconds_in_month.values, (1, -2, -1))
-        tmp = data_shape.copy()
-        tmp[0] = 1
-        tmp[2] = 1
-        multiplier = np.tile(multiplier, tmp)
-        data['data'] *= multiplier
-        
-        units = 'mm/month'
-        variable='tp'
-    elif variable == 't2m':
-        data['data'] -= 273.15
-        units = 'C'
-    
-    tmp = MeteoRaster(data, units=units, variable=variable)
-    return(tmp)
-
-def readCORDEX_monthly(file, variable, convention=pd.offsets.MonthBegin(), remove_time=True):
-    '''
-    Reads CORDEX CMIP 5 monthly data.
-    
-    variable:
-        pr - precipitation
-        tas - air temperature near surface
-        
-    convention (pandas offset):
-        pd.offsets.MonthBegin()
-        None - file default
-    '''
-    
-    data = {}
-    with xr.open_dataset(file) as ds:
-        data['latitudes'] = ds.lat.data
-        data['longitudes'] = ds.lon.data
-        data['productionDates'] = ds.time.data
-        data['data'] = ds[variable][:, :, :].data
-    data['leadtimes'] = np.array([pd.DateOffset(days=0)])
-        
-    if not convention is None:
-        data['productionDates'] = [d + convention for d in data['productionDates']]
-    if remove_time:
-        data['productionDates'] = [d.normalize() for d in data['productionDates']]
-
-    if variable=='tas':
-        units = 'C'
-        variable = 'Air temperature near surface'
-    elif variable=='pr':
-        units = 'mm/month'
-        variable = 'Precipitation'
     else:
-        raise(Exception(f'How to handle variable "{variable}" must be defined.'))
+        units = 'm/s'                                         # u10, v10
+
+    offsets = steps - steps[0] if _CUMULATIVE[variable] else steps
+    stamps = (np.asarray(data['production_datetime']).reshape(-1, 1)
+              + np.asarray(offsets).reshape(1, -1))
+    data['production_datetime'] = stamps.ravel()
+    data['data'] = data['data'].reshape((-1,) + data['data'].shape[-2:])
 
     data['data'] = np.expand_dims(data['data'], [1, 2])
+    data['leadtimes'] = np.array([pd.DateOffset(days=0)])
 
-    tmp = MeteoRaster(data, units=units, variable=variable)
-    tmp.trim()
-    
-    return tmp
+    raster = MeteoRaster(data, units=units, variable=variable)
+    raster.trim()
 
-
-if __name__ == '__main__':
-    
-    import matplotlib.pyplot as plt
-    
-    #===========================================================================
-    # file = Path(r'C:\Users\zepedro\Documents\GitHub\Climate-change\data\ERA5 land') / 'pr_MOROCCO_ERA5Land.grib'
-    # era5 = readERA5Land_monthly(file, 'tp')
-    # data = era5.plot_mean(coastline=True, borders=False, colorbar=True,
-    #                      colorbar_label=f'[{era5.units}]', cmap='viridis', central_longitude=20, central_latitude=30)
-    #===========================================================================
-
-    #===========================================================================
-    # file = Path(r'C:\Users\zepedro\Documents\GitHub\Climate-change\data\ERA5 land') / 'tas_MOROCCO_ERA5Land.grib'
-    # era5 = readERA5Land_monthly(file, 't2m')
-    # data = era5.plot_mean(coastline=True, borders=False, colorbar=True,
-    #                      colorbar_label=f'[{era5.units}]', cmap='magma', central_longitude=20, central_latitude=30)
-    #===========================================================================
+    return raster

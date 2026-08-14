@@ -1,0 +1,160 @@
+name: tests
+
+# The suite never ran in CI before. Two jobs, because they catch different things:
+#
+#  - `conda` runs everything, including the GDAL-dependent zonal aggregation.
+#  - `minimal` installs the package with --no-deps plus only the core stack, so it
+#    proves `import meteoraster` works without GDAL, cartopy, matplotlib or
+#    seaborn. That is the slim-container case, and it is what would have caught
+#    `from osgeo import ogr` sitting at module scope.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Called by release.yml, so a tag can only be published if the suite is green.
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  # Not cancel-in-progress: a release run waits on this workflow, and cancelling it
+  # would fail the release rather than block it.
+  group: tests-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  conda:
+    name: conda (GDAL, full suite)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Install the package
+        run: pip install -e ".[test]"
+
+      - name: Show the stack
+        run: |
+          python -c "import numpy, pandas, xarray, scipy; print('numpy', numpy.__version__); print('pandas', pandas.__version__); print('xarray', xarray.__version__); print('scipy', scipy.__version__)"
+          python -c "from osgeo import gdal; print('gdal', gdal.__version__)"
+          python -c "from meteoraster import io; print('read engines', io.available_engines())"
+
+      - name: Sanity-check the GRIB stack
+        # cfgrib raises RuntimeError - not ImportError - when it cannot find the
+        # ecCodes binary, and the reader tests then skip rather than fail. Assert it
+        # up front so a broken GRIB stack is a red job instead of silent coverage loss.
+        run: python -c "import cfgrib, eccodes; print('cfgrib', cfgrib.__version__, 'eccodes', eccodes.codes_get_api_version())"
+
+      - name: Sanity-check the linear algebra
+        # A broken BLAS/LAPACK build crashes the interpreter (not an exception) the
+        # first time scipy's LinearNDInterpolator or numpy.linalg is used, which
+        # takes the whole suite down with no traceback. Fail loudly and early here
+        # instead.
+        run: python -c "import numpy as np; assert np.allclose(np.linalg.inv(np.array([[1.,2.],[3.,4.]])) @ np.array([[1.,2.],[3.,4.]]), np.eye(2))"
+
+      - name: Run the suite
+        env:
+          MPLBACKEND: Agg
+        run: pytest -ra
+
+  minimal:
+    name: minimal (${{ matrix.python }}, numpy ${{ matrix.numpy }}, no GDAL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both sides of the relaxed numpy pin.
+          - python: '3.11'
+            numpy: '1.26.*'
+          - python: '3.12'
+            numpy: '2.*'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install only the core stack
+        # --no-deps deliberately: nothing optional, so a heavy import creeping back
+        # to module scope fails here.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy==${{ matrix.numpy }}" scipy pandas xarray h5netcdf h5py pytest
+          python -m pip install --no-deps -e .
+
+      - name: Import without GDAL, cartopy, matplotlib or seaborn
+        run: |
+          python - <<'PY'
+          import importlib.util
+          for absent in ('osgeo', 'cartopy', 'matplotlib', 'seaborn'):
+              assert importlib.util.find_spec(absent) is None, absent + ' should not be installed here'
+
+          import meteoraster
+          from meteoraster.io import read_header, iter_productions, available_engines
+          from meteoraster import zonal
+          print('meteoraster', meteoraster.MeteoRaster.VERSION, 'engines', available_engines())
+          PY
+
+      - name: Round-trip a file with only the core stack
+        run: |
+          python - <<'PY'
+          import numpy as np, pandas as pd, tempfile, pathlib
+          from meteoraster import MeteoRaster
+          from meteoraster import io as mrio
+
+          data = np.arange(2 * 2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 2, 3, 4, 5)
+          raster = MeteoRaster(data=data,
+                               latitudes=np.linspace(40, 30, 4),
+                               longitudes=np.linspace(-10, 10, 5),
+                               production_datetime=pd.to_datetime(['2024-01-01', '2024-01-02']).values,
+                               leadtimes=np.array([pd.Timedelta(hours=h) for h in (0, 1, 2)]),
+                               units='mm', variable='precip', verbose=False)
+
+          path = pathlib.Path(tempfile.mkdtemp()) / 'r.nct'
+          raster.save(path)
+
+          back = MeteoRaster.load(path, verbose=False)
+          assert np.allclose(raster.data, back.data)
+          assert back.data.dtype == np.float32, back.data.dtype
+          assert str(np.asarray(back.leadtimes).dtype) == 'timedelta64[ns]'
+          assert str(back.production_datetime.dtype) == 'datetime64[ns]'
+
+          header = mrio.read_header(path)
+          assert header.shape == data.shape
+          blocks = list(mrio.iter_productions(path, reduce_members='mean'))
+          assert len(blocks) == 2 and blocks[0][1].shape == data.shape[2:]
+          print('round trip OK')
+          PY
+
+      - name: A GDAL-only call must explain itself
+        run: |
+          python - <<'PY'
+          from meteoraster import zonal
+          try:
+              zonal.read_kml_polygons('nowhere.kml')
+          except ImportError as ex:
+              assert 'gdal' in str(ex).lower(), ex
+              print('helpful ImportError:', ex)
+          else:
+              raise AssertionError('expected an ImportError naming GDAL')
+          PY
+
+      - name: Run the suite (GDAL-dependent tests skip)
+        env:
+          MPLBACKEND: Agg
+        run: pytest -ra

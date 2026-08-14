@@ -3,12 +3,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import numpy as np
-import pandas as pd
 import pytest
-import xarray as xr
+
+# Plotting is optional, so the whole module is skipped when it is not installed -
+# otherwise collection fails with ModuleNotFoundError and takes the session down,
+# which is exactly what the minimal CI job installs.
+plt = pytest.importorskip('matplotlib.pyplot', reason='matplotlib is not installed')
+ccrs = pytest.importorskip('cartopy.crs', reason='cartopy is not installed')
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,19 +17,7 @@ if str(ROOT) not in sys.path:
 
 from meteoraster import MeteoRaster
 
-RESOURCES = Path(__file__).resolve().parent / "resources"
-
-
-def read_gleam(file):
-    data = {}
-    with xr.open_dataset(file) as ds:
-        data['latitudes'] = ds.lat.data
-        data['longitudes'] = ds.lon.data
-        data['production_datetime'] = ds.time.data
-        data['leadtimes'] = np.array([pd.DateOffset(years=0)])
-        tmp = ds['E'][:, :, :].data
-        data['data'] = np.expand_dims(tmp, [1, 2])
-    return MeteoRaster(data, units='mm/year', variable='AET')
+from conftest import require_resource
 
 def test_create_plot(sample_meteoraster):
     mr = sample_meteoraster
@@ -107,23 +96,27 @@ def test_plot_mean_projected(sample_meteoraster):
         pytest.fail(f"plot_mean_projected raised an exception: {e}")
     plt.close()
 
-def test_gleam_read_and_plot():
-    gleam_file = RESOURCES / "E_2016_GLEAM_v4.2b_YR.nc"
-    aet = read_gleam(gleam_file)
+def test_real_raster_read_and_plot():
+    '''
+    The only test that plots real data rather than the synthetic fixture. It replaces
+    the GLEAM one, which carried a 6.2 MB resource and its own ad-hoc reader.
+    '''
 
-    assert aet is not None
-    assert aet.variable == 'AET'
-    assert aet.units == 'mm/year'
+    file = require_resource('tethys_NOAA_GFS_0.25_2026.05.18.nct')
+    forecast = MeteoRaster.load(file, verbose=False)
 
-    ax = aet.create_plot(central_longitude=20)
-    ax, cbar = aet.plot_mean(
+    assert forecast.units == 'C'
+    assert forecast.data.shape[0] > 1                  # several productions
+
+    ax = forecast.create_plot(central_longitude=5)
+    ax, cbar = forecast.plot_mean(
         ax=ax,
         coastline=True,
         borders=True,
         colorbar=True,
         cmap='viridis',
-        central_longitude=20,
-        central_latitude=0,
+        central_longitude=5,
+        central_latitude=50,
         block=False,
     )
 

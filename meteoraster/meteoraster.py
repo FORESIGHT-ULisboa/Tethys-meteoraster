@@ -1,27 +1,150 @@
 import math
 import copy
-import gc
 import os
 import warnings
-import shutil
 import tempfile
 import numpy as np
 import xarray as xr
 import datetime as dt
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import xml.etree.ElementTree as et
 from pathlib import Path
-from osgeo import ogr
-import scipy.interpolate as interp
-import cartopy.crs as ccrs
-import cartopy.feature as cf
-import cartopy.io.shapereader as shpreader
+
+from . import _lazy
+from . import io as _io
+from . import zonal as _zonal
+
+# GDAL/OGR, matplotlib, seaborn and cartopy are imported on demand through
+# _lazy so that `import meteoraster` works without them - see _lazy.py.
 
 class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
+
+    v3.0:
+        BREAKING - four readers are gone. meteoraster.utils keeps only
+        readERA5Land_monthly and read_ERA5Land_hourly; readERA5_monthly, read_GFS,
+        read_C3S and readCORDEX_monthly are removed. All six were dead code - they
+        populated data['productionDates'] while __init__ reads
+        data['production_datetime'] (renamed in 9c79551, which missed the file), so
+        every one raised KeyError. Converted Tethys output needs no reader: use
+        MeteoRaster.load.
+
+        BREAKING - get_values_from_KML returns different numbers. It now runs on
+        meteoraster.zonal instead of the legacy coverage builder, which clipped its
+        candidate cells to 0 < i < n-1 and so left the outermost row and column of the
+        grid without coverage; because the weights were renormalised by the area it did
+        find, the result looked plausible with the border silently missing (measured:
+        1.0 on a 3x3 grid whose true area-weighted mean is 9.0). Its coverage threshold
+        was also read from zone 0 and applied to every zone. Both are fixed.
+        ensemble_member labels are now 0-based, matching get_values_from_latlon and
+        get_quantiles_from_KML; `elementwise` is accepted, ignored and warns, since the
+        missing-data renormalisation it skipped is now always applied. This also removes
+        the last scipy LinearNDInterpolator from a library code path.
+
+        BREAKING - single-leadtime up-sampling in Resample returns different numbers,
+        as described under v2.6 below.
+
+        The two surviving readers work, and are covered numerically against real
+        ERA5-Land GRIB. Beyond the key rename: the monthly reader filtered on
+        stepType='avgad' where CDS now delivers 'avgas', and could not read a file
+        holding two variables with different stepTypes or a single month (a collapsed
+        time dimension made ds[variable][:, :, :] raise and days_in_month return an
+        int); the hourly reader's drop/borrow guards were hard-coded to December 31 and
+        so never fired on a month boundary, it stamped instantaneous fields an hour
+        early (cfgrib's valid_time is date + step, not date + step - step[0]), it
+        hard-coded 24 steps per day, and `sd` skipped the reshape and so could not build
+        a MeteoRaster at all.
+
+        Resample handles unevenly spaced leadtimes (Resample.VERSION 2.1). Operational
+        forecasts go hourly, then 3-hourly, then 6-hourly; the kernel now finds a
+        sub-step's source column by searchsorted over the leadtimes and weights it by
+        that column's own span, so 'sum' still conserves mass when a 1 h and a 6 h
+        column land in the same output window. Uniform leadtimes are bit-for-bit
+        unchanged. A forecast with one production row is accepted (only the time-series
+        path needs two), and calendar leadtimes now raise a message that says so
+        instead of pandas' "Invalid type for timedelta scalar".
+
+        adjust_leadtimes works on monthly data. It measured its horizon with
+        `.dt.days`, which raised AttributeError whenever the leadtimes were already
+        pd.DateOffsets - that is, on exactly the seasonal forecasts it exists for.
+
+        Testing: real ERA5-Land GRIB and converted Tethys forecasts are now part of the
+        suite (ERA5-Land monthly and hourly, ECMWF SEAS5 seasonal, IPMA, NOAA GFS),
+        covering de-accumulation, the monthly DateOffset adaptation, member reduction
+        and the resampling units contract. Fixtures skip by name when absent, so a
+        clone without them still passes. The GLEAM resource and its ad-hoc reader are
+        gone.
+
+    v2.6:
+        Works in a slim container. GDAL, matplotlib, seaborn and cartopy are now
+        imported on demand, so `import meteoraster` no longer fails without them -
+        before this, `from osgeo import ogr` at module scope made the package
+        unimportable in a pip-only image even for save/load, which need no GDAL.
+
+        Reads are portable across installs. A new module, meteoraster.io, is the
+        single door to a file: it tries the read engines in turn (h5netcdf, netcdf4,
+        scipy) and pins the decoding choices that drift between xarray releases. The
+        same file was decoding `leadtime` as timedelta64[us] on xarray 2026.7 and
+        timedelta64[ns] on 2023.12; `engine='h5netcdf'` was raising
+        ValueError("unrecognized engine") wherever h5netcdf was absent even though
+        netcdf4 could read the file; and monthly DateOffset leadtimes could come
+        back as bare integers. h5py is now declared explicitly, because h5netcdf
+        >=1.6 no longer depends on it.
+
+        Large files no longer have to be held whole. io.read_header reads metadata
+        only, and io.iter_productions streams one production at a time - measured
+        126 MB peak against 467 MB for load() on a 352 MB cube. load() also takes
+        productions/leadtimes/dtype for a partial read.
+
+        New module meteoraster.zonal: sparse coverage (per-zone cell indices and
+        weights), exact fractional overlap, and area-weighted means and quantiles
+        that renormalise for missing data per zone and per slice. It derives cell
+        corners with numpy instead of two scipy interpolators, so the outermost row
+        and column of the grid finally take part, and it reads namespaced KML
+        without rewriting the caller's file. get_values_from_KML was still on the old
+        builder at this point; v3.0 rewired it.
+
+        get_quantiles_from_KML works. __groupByQuantile had an unconditional
+        `raise Exception('This must be reviewed.')` with the rest of the method dead
+        behind it. Quantiles are now exact weighted quantiles rather than replicating
+        each cell round(weight/precision) times, which cost 10x the memory and
+        dropped any cell covering less than one precision step; `precision` is
+        accepted, ignored and warns. Which axes are pooled is explicit via `pool=`.
+
+        Memory: get_cropped no longer deep-copies the whole uncropped cube nor
+        indexes it four times over (973 MB -> 621 MB peak on that same file);
+        join/adjust_leadtimes/resample_timestep keep float32 instead of silently
+        promoting to float64; is_complete/get_complete_index/get_missing walk one
+        production at a time instead of allocating a full-size boolean array.
+
+        save() writes its temporary file in the destination directory and swaps it in
+        with os.replace, so the swap is atomic and nothing is staged through /tmp -
+        which in a container is often tmpfs or a different filesystem. Saved files are
+        0644 rather than 0600, so a shared volume is readable.
+
+        Fixed: da_attrs/ds_attrs defaulted to shared mutable dicts that
+        _update_attrs() wrote into, so one raster's units and variable leaked into
+        later ones - and since save() uses self.variable as the NetCDF variable name,
+        the name written to disk could come from an unrelated object; load() bound
+        both attribute dicts to ds.attrs, so each round trip accreted global
+        attributes; a single-latitude-row raster raised IndexError in __init__, so it
+        saved but could never be loaded; resample_timestep raised TypeError on its
+        last diagnostic line; get_missing swapped its leadtime and ensemble_member
+        labels; the size-1 level drop compared against 'Zone' instead of 'zone', so a
+        single-zone layer lost its zone level entirely.
+
+        Resample was rewritten (Resample.VERSION 2.0) around exact integer-nanosecond
+        index arithmetic, and now documents its contract: 'sum' is extensive and
+        rescales with the step, 'mean'/'linear'/'max' are intensive and
+        step-invariant, every value describes [stamp, stamp + step). Down-sampling is
+        unchanged; single-leadtime up-sampling returns different numbers, because
+        'sum' now splits the total across the sub-steps instead of emitting a sliding
+        total over the whole production step. Calendar steps ('MS', 'M') are rejected
+        rather than silently treated as fixed durations. See AGENTS.md for the detail.
+
+        numpy is no longer capped below 2, and CI now runs the suite - it never did
+        before - on the full conda environment and on a deliberately minimal
+        pip install.
 
     v2.5:
         Published on PyPI - installs with `pip install meteoraster`. Releases are
@@ -55,7 +178,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '2.5'
+    VERSION = '3.0'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
 
@@ -63,7 +186,7 @@ class MeteoRaster(object):
     
     def __init__(self, data,
                  latitudes=None, longitudes=None, production_datetime=None, leadtimes=None,
-                 units='unknown', variable='unknown', da_attrs={}, ds_attrs={},
+                 units='unknown', variable='unknown', da_attrs=None, ds_attrs=None,
                  verbose=None,
                  ):
         '''
@@ -73,10 +196,10 @@ class MeteoRaster(object):
         leadtimes: 1-D numpy array
         latitudes: 1-D numpy array (center)
         longitudes: 1-D numpy array (center)
-        
+
         alternatively, data can be a dict with the previous fields
         '''
-        
+
         if verbose is None:
             self.verbose = self.VERBOSE
         else:
@@ -84,10 +207,15 @@ class MeteoRaster(object):
 
         self.units = units
         self.variable = variable
-        self.da_attrs = da_attrs
-        self.ds_attrs = ds_attrs
+        # These default to None and are copied because _update_attrs() writes into
+        # them. As shared mutable defaults ({}), one instance's units and variable
+        # leaked into every later instance built without explicit attrs - and since
+        # save() uses self.variable as the NetCDF variable name, the name written to
+        # disk could come from an unrelated object in the same process.
+        self.da_attrs = {} if da_attrs is None else dict(da_attrs)
+        self.ds_attrs = {} if ds_attrs is None else dict(ds_attrs)
         self._update_attrs()
-        
+
         if isinstance(data, dict):
             self.data = data['data']
             self.latitudes = data['latitudes']
@@ -111,13 +239,18 @@ class MeteoRaster(object):
         if self.longitudes.ndim==1:
             if max(self.longitudes)>180:
                 self._fixStartAtGreenwich()
-                
+
             # Process geometry so that lats and lons are stored in 2D
         if self.longitudes.ndim==1 and self.latitudes.ndim==1:
             self.longitudes, self.latitudes = np.meshgrid(self.longitudes, self.latitudes)
-    
-            # Flip latitudes (if required)
-        if self.latitudes[0, 0]<self.latitudes[1, 0]:
+        elif self.longitudes.ndim != self.latitudes.ndim:
+            raise ValueError('latitudes (%d-D) and longitudes (%d-D) must both be 1-D or both 2-D.'
+                             % (self.latitudes.ndim, self.longitudes.ndim))
+
+            # Flip latitudes (if required). Guarded on the row count: a
+            # single-latitude-row raster (get_cropped can produce one) used to raise
+            # IndexError here, so such a file saved but could never be loaded.
+        if self.latitudes.shape[0]>1 and self.latitudes[0, 0]<self.latitudes[1, 0]:
             self._flipLatitude()
     
     def _update_attrs(self):
@@ -139,11 +272,21 @@ class MeteoRaster(object):
         else:
             self.da_attrs['variable'] = self.variable
     
-    def create_plot(self, central_longitude, projection_kwargs={}, figsize=None, projection_fun=ccrs.PlateCarree, crs=ccrs.PlateCarree(), extent=None):
+    def create_plot(self, central_longitude, projection_kwargs={}, figsize=None, projection_fun=None, crs=None, extent=None):
         '''
         extent [west, east, south, north]
+
+        projection_fun and crs default to cartopy PlateCarree; they are None in
+        the signature because cartopy is imported on demand.
         '''
-        
+
+        plt = _lazy.pyplot()
+        ccrs = _lazy.ccrs()
+        if projection_fun is None:
+            projection_fun = ccrs.PlateCarree
+        if crs is None:
+            crs = ccrs.PlateCarree()
+
         plt.figure(figsize=figsize)
         projection = projection_fun(central_longitude=central_longitude, **projection_kwargs)
         ax = plt.axes(projection=projection)
@@ -151,17 +294,26 @@ class MeteoRaster(object):
             ax.set_extent(extent, crs=crs)
         return ax
 
-    def add_shapefile(self, ax, shapefile_path, crs=ccrs.PlateCarree(), **kwargs):
+    def add_shapefile(self, ax, shapefile_path, crs=None, **kwargs):
         '''
-        
+
         '''
+
+        shpreader = _lazy.shapereader()
+        if crs is None:
+            crs = _lazy.ccrs().PlateCarree()
 
         ax.add_geometries(shpreader.Reader(shapefile_path).geometries(), crs=crs, **kwargs)
 
-    def add_shape(self, ax, path, color='black', facecolor='none', linewidth=1, crs=ccrs.PlateCarree()):
+    def add_shape(self, ax, path, color='black', facecolor='none', linewidth=1, crs=None):
         '''
-        
+
         '''
+        plt = _lazy.pyplot()
+        shpreader = _lazy.shapereader()
+        if crs is None:
+            crs = _lazy.ccrs().PlateCarree()
+
         reader = shpreader.Reader(path)
 
         for record in reader.records():
@@ -175,14 +327,17 @@ class MeteoRaster(object):
         Plots the mean behavior for the full time series
         '''
           
+        plt = _lazy.pyplot()
+        ccrs = _lazy.ccrs()
+
         if isinstance(ax, type(None)):
             ax = self.create_plot(central_longitude)
-        
+
         if isinstance(xarray, type(None)):
             xarray = self.to_xarray()
             xarray = xarray.mean(dim=['production_datetime', 'ensemble_member', 'leadtime'])*multiplier
-            
-            
+
+
         plot = xarray.plot.pcolormesh(ax=ax, transform=ccrs.PlateCarree(), x="lon", y="lat", add_colorbar=False, cmap=cmap, *args, **kwargs)
         if colorbar:
             if colorbar_label is None:
@@ -191,11 +346,13 @@ class MeteoRaster(object):
         else:
             cbar = None
             
-        if coastline:
-            ax.add_feature(cf.COASTLINE)
-        if borders:
-            ax.add_feature(cf.BORDERS)
-            
+        if coastline or borders:
+            cf = _lazy.cfeature()
+            if coastline:
+                ax.add_feature(cf.COASTLINE)
+            if borders:
+                ax.add_feature(cf.BORDERS)
+
         plt.show(block=block)
     
         return ax, cbar
@@ -205,13 +362,14 @@ class MeteoRaster(object):
         Plots the mean behavior for the full time series using the true coordinates
         '''
 
-        sns.color_palette('viridis')
-    
+        plt = _lazy.pyplot()
+        _lazy.seaborn().color_palette('viridis')
+
         tmp = np.nanmean(self.data, axis=(0,1,2))*multiplier
-    
+
         if isinstance(ax, type(None)):
             plt.figure()
-    
+
         plt.scatter(self.longitudes.ravel(), self.latitudes.ravel(), c=tmp.ravel(), *args, **kwargs)
         plt.colorbar()
         plt.show(block=block)
@@ -221,9 +379,11 @@ class MeteoRaster(object):
         Plots the available coordinates in the lat and lon matrixes
         '''
 
+        plt = _lazy.pyplot()
+
         if isinstance(ax, type(None)):
             plt.figure()
-    
+
         plt.plot(self.longitudes.ravel(), self.latitudes.ravel(), 'k.', *args, **kwargs)
         plt.show(block=block)
 
@@ -246,46 +406,145 @@ class MeteoRaster(object):
         tmp.loc[:, 'Day of year'] = tmp.loc[:, 'Production dates'].dt.day_of_year
 
         if isinstance(ax, type(None)):
-            plt.figure(figsize=(20,10))
-        ax = sns.lineplot(x='Day of year', y='values', data=tmp, errorbar=('pi', 95), ax=ax, *args, **kwargs)
-        
+            _lazy.pyplot().figure(figsize=(20,10))
+        ax = _lazy.seaborn().lineplot(x='Day of year', y='values', data=tmp, errorbar=('pi', 95), ax=ax, *args, **kwargs)
+
         return ax
 
-    def get_values_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False, elementwise=False):
+    def get_values_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False,
+                            elementwise=False, min_coverage=None, on_error='raise'):
         '''
-        Returns a pandas table with averaged values        
+        Area-weighted mean of each KML zone, per production, member and leadtime.
+
+        Returns (agg, centroids). agg is indexed by production datetime and its columns
+        are a MultiIndex over the surviving levels of (zone, leadtime, ensemble_member);
+        size-1 levels are dropped except zone.
+
+        v3.0 runs this on meteoraster.zonal instead of the legacy coverage builder, so
+        the numbers changed for any zone touching the edge of the grid. The old builder
+        clipped its candidate cells to 0 < i < n-1, which left the outermost row and
+        column of the grid without coverage; because weights were renormalised by the
+        area actually found, the result looked plausible with the border silently
+        missing. Its coverage threshold was also read from zone 0 and applied to every
+        zone. Both are fixed, and ensemble_member labels are now 0-based, matching
+        get_values_from_latlon and get_quantiles_from_KML.
+
+        min_coverage: fraction of a zone's weight that must carry data for a slice to
+              be reported, tested per zone and per slice. Defaults to
+              zonal.MIN_COVERAGE.
+        elementwise: accepted for backwards compatibility and ignored. It skipped the
+              missing-data renormalisation, which apply_coverage now always applies.
         '''
-        
+
+        if elementwise:
+            warnings.warn('The `elementwise` argument of get_values_from_KML() is ignored: the '
+                          'area weights are always renormalised over the cells that carry data. '
+                          'Remove the argument.', DeprecationWarning, stacklevel=2)
+
+        if min_coverage is None:
+            min_coverage = _zonal.MIN_COVERAGE
+
         if isinstance(coverage_info, type(None)):
-            cvr, columns, centroids = self.__coverageMatrixFromKML(kml, nameField)
-            coverage_info = (cvr, columns, centroids)
+            coverage = _zonal.coverage_from_kml(kml, self.latitudes, self.longitudes,
+                                                name_field=nameField, on_error=on_error,
+                                                normalize='area')
+            coverage_info = coverage
         else:
-            cvr, columns, centroids = coverage_info
-        
-        agg = self.__groupByMatrix(cvr, columns, elementwise=elementwise)
-        
+            coverage = self.__as_coverage(coverage_info)
+
+        agg = self.__groupByCoverage(coverage, min_coverage)
+
+        centroids = coverage.centroids
+
         if getCoverageInfo:
             return agg, centroids, coverage_info
         else:
             return agg, centroids
 
-    def get_quantiles_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False, resampling=None, precision=0.1, quantiles=[0.01, 0.1, 0.5, 0.9, 0.99]):
+    def get_quantiles_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False,
+                               resampling=None, quantiles=(0.01, 0.1, 0.5, 0.9, 0.99),
+                               pool=('space',), min_coverage=None, method='hazen',
+                               precision=None, on_error='raise'):
         '''
-        Returns a pandas table with averaged values      
+        Area-weighted spatial quantiles over the KML zones.
+
+        Returns (agg, centroids). agg is indexed by production datetime and its
+        columns are a MultiIndex over the surviving levels of
+        (zone, leadtime, ensemble_member, quantile); size-1 levels are dropped
+        except zone and quantile.
+
+        A cell half inside a zone carries half the probability mass, which is what
+        the coverage weights mean. Quantiles are computed exactly - see
+        zonal.weighted_quantiles - rather than by replicating each cell
+        round(weight / precision) times, which cost 10x the memory and dropped any
+        cell covering less than one `precision` step.
+
+        pool: which axes are pooled into the sample, from
+              {'space', 'leadtime', 'production', 'members'}. 'space' is required.
+              The default pools only the zone's cells, giving one distribution per
+              (production, member, leadtime) - the direct spatial analogue of
+              get_values_from_KML.
+
+              'time' lives on a different axis depending on the layout, because the
+              event time is production_datetime + leadtime, so the axis is named
+              explicitly. For a forecast (many leadtimes) pool 'leadtime'; for an
+              observation/reanalysis raster (one leadtime, many productions) pool
+              'production'.
+
+        resampling: a pandas offset giving the *block size* within the pooled time
+              axis, not a relabelling. pool=('space', 'leadtime') with
+              resampling='1D' on an hourly forecast pools all the values in a zone
+              across each day into one distribution - the hourly-to-daily case.
+              With resampling=None the whole pooled axis is a single block and its
+              level is dropped from the columns.
+
+        method: 'hazen' (default) or 'linear'. See zonal.weighted_quantiles.
+        precision: accepted for backwards compatibility, ignored, and warns when
+              passed - the result no longer depends on it.
         '''
-        
+
+        if precision is not None:
+            warnings.warn('The `precision` argument of get_quantiles_from_KML() is ignored: '
+                          'quantiles are now computed exactly instead of by replicating each '
+                          'cell round(weight / precision) times. Remove the argument.',
+                          DeprecationWarning, stacklevel=2)
+
+        if min_coverage is None:
+            min_coverage = _zonal.MIN_COVERAGE
+
         if isinstance(coverage_info, type(None)):
-            cvr, columns, centroids = self.__coverageMatrixFromKML(kml, nameField, normalize_by_area=False)
-            coverage_info = (cvr, columns, centroids)
+            coverage = _zonal.coverage_from_kml(kml, self.latitudes, self.longitudes,
+                                                name_field=nameField, on_error=on_error,
+                                                normalize='cell_fraction')
+            coverage_info = coverage
         else:
-            cvr, columns, centroids = coverage_info
-        
-        agg = self.__groupByQuantile(cvr, columns, resampling, quantiles, precision)
-        
+            coverage = self.__as_coverage(coverage_info)
+
+        agg = self.__groupByQuantile(coverage, resampling, quantiles, pool, min_coverage, method)
+
+        centroids = coverage.centroids
+
         if getCoverageInfo:
             return agg, centroids, coverage_info
         else:
             return agg, centroids
+
+    @staticmethod
+    def __as_coverage(coverage_info):
+        '''
+        Accepts a zonal.Coverage or the legacy (dense, columns, centroids) tuple.
+        '''
+
+        if isinstance(coverage_info, _zonal.Coverage):
+            return coverage_info
+
+        if isinstance(coverage_info, tuple) and len(coverage_info) == 3:
+            dense, _, centroids = coverage_info
+            zones = list(centroids.index) if centroids is not None else None
+            return _zonal.Coverage.from_dense(dense, zones=zones, centroids=centroids)
+
+        raise TypeError('coverage_info must be a zonal.Coverage or a legacy '
+                        '(coverage, columns, centroids) tuple.')
 
     def get_cropped(self, from_prod_date=dt.datetime(1900, 1, 1), to_prod_date=dt.datetime(2199, 12, 31),
                    from_lat=-90, to_lat=90, from_lon=-180, to_lon=180,
@@ -314,27 +573,44 @@ class MeteoRaster(object):
         latitudes = np.round(latitudes[:, lon_idxs],6)
         longitudes = np.round(self.longitudes[lat_idxs, :],6)
         longitudes = np.round(longitudes[:, lon_idxs],6)
-        data = self.data[date_idxs, :, :, :, :]
-        data = data[:, :, :, lat_idxs, :]
-        data = data[:, :, :, :, lon_idxs]
-        
-        cropped = copy.deepcopy(self)
+
+        leadtimes = copy.deepcopy(self.leadtimes)
+        leadtime_selection = slice(None)
+        if from_leadtime or to_leadtime:
+            keep = np.ones(len(leadtimes), dtype=bool)
+            if from_leadtime:
+                keep &= np.asarray(leadtimes >= from_leadtime)
+            if to_leadtime:
+                keep &= np.asarray(leadtimes <= to_leadtime)
+            leadtimes = leadtimes[keep]
+            leadtime_selection = self._as_slice(np.flatnonzero(keep))
+
+        # The spatial ranges are contiguous by construction, so taking them first is
+        # a free view; only then are the (possibly non-contiguous) date and leadtime
+        # selections applied, at the already-reduced spatial size. The previous
+        # version indexed four times in a row - the first with a fancy index over
+        # every date, which copied the *whole* uncropped cube - on top of a
+        # copy.deepcopy(self) that had copied it once more.
+        # Note the selections are applied one subscript at a time on purpose: two
+        # advanced indices in a single subscript would be broadcast against each
+        # other rather than combined.
+        view = self.data[:, :, :, self._as_slice(lat_idxs), self._as_slice(lon_idxs)]
+        date_selection = self._as_slice(date_idxs)
+        if not (isinstance(date_selection, slice) and date_selection == slice(0, self.data.shape[0])):
+            view = view[date_selection]
+        if not isinstance(leadtime_selection, slice) or leadtime_selection != slice(None):
+            view = view[:, :, leadtime_selection]
+        data = np.ascontiguousarray(view)
+
+        cropped = copy.copy(self)
+        cropped.da_attrs = dict(self.da_attrs)
+        cropped.ds_attrs = dict(self.ds_attrs)
+        cropped.leadtimes = leadtimes
         cropped.production_datetime = production_datetime
         cropped.latitudes = latitudes
         cropped.longitudes = longitudes
-        
-        if from_leadtime:
-            idxs = cropped.leadtimes>=from_leadtime
-            cropped.leadtimes = cropped.leadtimes[idxs]
-            data = data[:, :, idxs, :, :]
-        
-        if to_leadtime:
-            idxs = cropped.leadtimes<=to_leadtime
-            cropped.leadtimes = cropped.leadtimes[idxs]
-            data = data[:, :, idxs, :, :]
-                    
         cropped.data = data
-        
+
         self._diag('    Done.', self.verbose)
         
         return cropped
@@ -392,7 +668,7 @@ class MeteoRaster(object):
             else:
                 warnings.warn(warningMessage)
             shape = newData.shape
-            data = np.empty([shape[0], e0] + list(shape[2:])) * np.nan
+            data = self._nan_filled([shape[0], e0] + list(shape[2:]), newData.dtype)
             data[:, :e1, :, :, :] = newData
             newData = data
         elif e0<e1:
@@ -401,7 +677,7 @@ class MeteoRaster(object):
             else:
                 warnings.warn(warningMessage)
             shape = self.data.shape
-            data = np.empty([shape[0], e1] + list(shape[2:])) * np.nan
+            data = self._nan_filled([shape[0], e1] + list(shape[2:]), self.data.dtype)
             data[:, :e0, :, :, :] = self.data
             self.data = data
 
@@ -461,11 +737,18 @@ class MeteoRaster(object):
         Adjust leadtimes to relative time steps (useful for monthly)
         '''
         self._diag('Adjusting lead times...', self.verbose)
-        
+
+        # The horizon is measured by applying the last leadtime to the first
+        # production, which works for pd.Timedelta and pd.DateOffset alike. Reading
+        # `.dt.days` off it instead raised AttributeError on a raster whose leadtimes
+        # were already DateOffsets - i.e. on exactly the monthly data this is for.
+        reference = pd.Timestamp(self.production_datetime[0])
+        horizon_days = ((reference + self.leadtimes[-1]) - reference).days
+
         periodDefinition = {
-            'months': pd.Series([pd.DateOffset(months=i) for i in range(1, math.ceil(pd.Series(self.leadtimes[-1]).dt.days.values[0]/30)+1)]),
+            'months': pd.Series([pd.DateOffset(months=i) for i in range(1, math.ceil(horizon_days/30)+1)]),
             }
-        
+
         if period not in periodDefinition.keys():
             raise(Exception('%s is not a valid period.' % period))
         
@@ -478,7 +761,7 @@ class MeteoRaster(object):
         validPeriods =  periodDefinition[period][:idxs.max()+1]
         
         tmp = list(self.data.shape)
-        data = np.empty(tmp[:2] + [validPeriods.size] + tmp[-2:]) * np.nan
+        data = self._nan_filled(tmp[:2] + [validPeriods.size] + tmp[-2:], self.data.dtype)
         
         for i0 in idxs:
             dataForLeadtime = self.data[:, :, idxs==i0, :, :]
@@ -505,13 +788,30 @@ class MeteoRaster(object):
     def get_missing(self):
         '''
         Provides a diagnostic of missing data
+
+        Rows are a (leadtime, ensemble_member) MultiIndex, columns are production
+        datetimes.
         '''
-        
-        missingFraction = np.isnan(self.data).mean(axis=(-2, -1))
-        missingFraction = pd.DataFrame(missingFraction.reshape((missingFraction.shape[0], np.prod(missingFraction.shape[1:]))), index=self.production_datetime)
+
+        members = self.data.shape[self.ENSEMBLEMEMBERpOSITION]
+
+        # One production at a time: np.isnan over the whole cube allocates a
+        # full-size boolean array.
+        missingFraction = np.empty((self.data.shape[0], self.data.shape[2], members))
+        for production in range(self.data.shape[0]):
+            fraction = np.isnan(self.data[production]).mean(axis=(-2, -1))  # [member, leadtime]
+            missingFraction[production] = fraction.T
+
+        # The axes are moved before flattening so that leadtime varies slowest and
+        # ensemble_member fastest, which is the order the MultiIndex below declares.
+        # Reshaping [production, member, leadtime] directly put leadtime fastest, so
+        # the two labels were swapped whenever there was more than one of each.
+        missingFraction = pd.DataFrame(missingFraction.reshape(missingFraction.shape[0], -1),
+                                       index=self.production_datetime)
         missingFraction.index.name = 'production_datetime'
-        missingFraction.columns = pd.MultiIndex.from_product((self.leadtimes, np.arange(self.data.shape[1])), names=['leadtime', 'ensemble_member'])
-        
+        missingFraction.columns = pd.MultiIndex.from_product((self.leadtimes, np.arange(members)),
+                                                            names=['leadtime', 'ensemble_member'])
+
         return missingFraction.transpose()
 
     def get_values_from_latlon(self, lat, lon):
@@ -580,6 +880,9 @@ class MeteoRaster(object):
         tmp = tmp.loc[tmp['available']>0,:].reset_index()
         tmp.loc[:, 'event_dates'] = tmp.loc[:, 'production_datetime'] + tmp.loc[:, 'leadtime']
         
+        plt = _lazy.pyplot()
+        sns = _lazy.seaborn()
+
         sns.set_theme(style="whitegrid")
         if individualMembers:
             g = sns.relplot(
@@ -618,7 +921,7 @@ class MeteoRaster(object):
         tmp = pd.DataFrame(np.arange(self.production_datetime.shape[0]), index=self.production_datetime)
         idxMax = tmp.resample(rule=rule).max().astype(int)+1
         
-        resampled = np.empty([idxMax.shape[0]] + list(self.data.shape[1:])) * np.nan
+        resampled = self._nan_filled([idxMax.shape[0]] + list(self.data.shape[1:]), self.data.dtype)
         idx0 = 0
         for i0, i1 in enumerate(idxMax.values.ravel()):
             resampled[i0, :, :, :, :] = fun(self.data[idx0:i1, :, :, :, :], axis=0, keepdims=True)
@@ -627,8 +930,11 @@ class MeteoRaster(object):
         self.data = resampled
         self.production_datetime = idxMax.index
     
-        self._diag('        Done (%s to %s).' % (self.production_datetime[0].strftime('%Y-%m-%d %H:%M:%S', self.verbose),
-                                                          self.production_datetime[-1].strftime('%Y-%m-%d %H:%M:%S')))
+        # The stray self.verbose used to be passed positionally to strftime, so this
+        # line raised TypeError on every successful call.
+        self._diag('        Done (%s to %s).' % (self.production_datetime[0].strftime('%Y-%m-%d %H:%M:%S'),
+                                                 self.production_datetime[-1].strftime('%Y-%m-%d %H:%M:%S')),
+                   self.verbose)
     
     def is_complete(self, full_ensemble:bool=True, space_completeness:bool=False) -> bool:
         '''
@@ -647,22 +953,30 @@ class MeteoRaster(object):
         if self.data is None:
             return False
 
-        finite = np.isfinite(self.data)
+        # Walked one production at a time, with an early exit. np.isfinite over the
+        # whole cube allocates a full-size boolean array, and save() calls this by
+        # default, so it used to add a grid-sized temporary to every write.
+        for production in range(self.data.shape[0]):
+            finite = np.isfinite(self.data[production])
 
-        # Ensemble requirement
-        if full_ensemble:
-            finite = finite.all(axis=1)  # -> [prod, leadtime, y, x]
-        else:
-            finite = finite.any(axis=1)  # -> [prod, leadtime, y, x]
+            # Ensemble requirement
+            if full_ensemble:
+                finite = finite.all(axis=0)  # -> [leadtime, y, x]
+            else:
+                finite = finite.any(axis=0)  # -> [leadtime, y, x]
 
-        # Spatial requirement
-        if space_completeness:
-            finite = finite.all(axis=(-2, -1))  # -> [prod, leadtime]
-        else:
-            finite = finite.any(axis=(-2, -1))  # -> [prod, leadtime]
+            # Spatial requirement
+            if space_completeness:
+                finite = finite.all(axis=(-2, -1))  # -> [leadtime]
+            else:
+                finite = finite.any(axis=(-2, -1))  # -> [leadtime]
 
-        # Temporal requirement: every production_datetime and every leadtime must be complete
-        return finite.all()
+            # Temporal requirement: every production_datetime and every leadtime
+            # must be complete
+            if not finite.all():
+                return False
+
+        return True
     
     def get_complete_index(self, full_ensemble:bool=True, space_completeness:bool=False) -> pd.DataFrame:
         '''
@@ -671,19 +985,22 @@ class MeteoRaster(object):
 
         self._diag('Retrieving complete index...', self.verbose)
 
-        finite = np.isfinite(self.data)
+        # One production at a time, for the same reason as is_complete().
+        finite = np.empty((self.data.shape[0], self.data.shape[2]), dtype=bool)
+        for production in range(self.data.shape[0]):
+            slice_ = np.isfinite(self.data[production])
 
-        # Ensemble requirement
-        if full_ensemble:
-            finite = finite.all(axis=1)  # -> [production_datetime, leadtime, y, x]
-        else:
-            finite = finite.any(axis=1)  # -> [production_datetime, leadtime, y, x]
+            # Ensemble requirement
+            if full_ensemble:
+                slice_ = slice_.all(axis=0)  # -> [leadtime, y, x]
+            else:
+                slice_ = slice_.any(axis=0)  # -> [leadtime, y, x]
 
-        # Spatial requirement
-        if space_completeness:
-            finite = finite.all(axis=(-2, -1))  # -> [production_datetime, leadtime] or [production_datetime, ensemble_member, leadtime]
-        else:
-            finite = finite.any(axis=(-2, -1))  # -> [production_datetime, leadtime] or [production_datetime, ensemble_member, leadtime]
+            # Spatial requirement
+            if space_completeness:
+                finite[production] = slice_.all(axis=(-2, -1))  # -> [leadtime]
+            else:
+                finite[production] = slice_.any(axis=(-2, -1))  # -> [leadtime]
 
         completeness_index = pd.DataFrame(finite, index=self.production_datetime, columns=self.leadtimes)
         completeness_index.index.name = 'production_datetime'
@@ -692,31 +1009,67 @@ class MeteoRaster(object):
         return completeness_index
 
     @classmethod
-    def get_completeness(cls, file) -> bool:
+    def get_completeness(cls, file):
         '''
-        Docstring for check_completeness
-        
-        :param file: Description
-        :return: Description
-        :rtype: bool
+        Reads the `complete` flag of a saved file without reading any values.
+
+        Returns None when the file carries no flag (it used to be a KeyError, and
+        an AttributeError when a writer had stored a real boolean).
         '''
 
-        try:
-            with xr.open_dataset(Path(file), decode_times=False, engine=cls.ENGINE) as ds:
-                return ds.attrs['complete'].lower() in ['true', 'yes']
-        except Exception as ex:
-            raise(ex)
-    
-    def save(self, file, complevel=1, complete=None) -> None:
+        return _io.read_completeness(file)
+
+    @classmethod
+    def read_header(cls, file):
         '''
-        Saves a netcdf file (.nc)
+        Reads a file's metadata (coordinates, shape, units) without its values.
+
+        See meteoraster.io.Header.
         '''
-        
+
+        return _io.read_header(file)
+
+    @classmethod
+    def iter_productions(cls, file, **kwargs):
+        '''
+        Yields (production_datetime, block) one production at a time.
+
+        Peak memory is one production block whatever the file size, which is what
+        makes aggregating a multi-GB archive possible. See
+        meteoraster.io.iter_productions for the arguments.
+        '''
+
+        return _io.iter_productions(file, **kwargs)
+
+
+    def save(self, file, complevel=1, complete=None, tmp_dir=None, mode=0o644,
+             engine=None) -> None:
+        '''
+        Saves a netcdf file (.nc / .nct)
+
+        The file is written to a temporary name in the *destination directory* and
+        then swapped in with os.replace, so the swap is atomic and nothing is
+        staged through the system temp dir. That matters in a container, where
+        /tmp is often tmpfs (the whole compressed file would be built in RAM) or a
+        different filesystem from the output volume (shutil.move would degrade to
+        copy + unlink, streaming the file twice).
+
+        tmp_dir: stage elsewhere when the destination directory is not writable.
+                 The swap is then a cross-device copy and no longer atomic.
+        mode:    permissions for the finished file, 0o644 by default. A temporary
+                 file is created 0o600 and the rename preserves it, so before this
+                 every saved file was readable only by the writing user - a
+                 regular problem for a container writing to a shared volume.
+                 Pass None to keep 0o600.
+        engine:  defaults to cls.ENGINE ('h5netcdf'). Use 'netcdf4' if h5netcdf
+                 rejects the zlib/complevel encoding keys on your stack.
+        '''
+
         if not isinstance(file, Path):
             file = Path(file)
-          
+
         self._diag('Saving %s...' % file, self.verbose)
-        
+
         data_array = self.to_xarray()
         ds = xr.Dataset({self.variable: data_array})
         ds['lat'].attrs['standard_name'] = 'latitude'
@@ -724,27 +1077,33 @@ class MeteoRaster(object):
 
         ds.attrs = {k: v for k, v in self.ds_attrs.items()}
         ds.attrs['history'] = data_array.attrs['saved']
+        ds.attrs['meteoraster_version'] = self.VERSION
         if complete is None:
             ds.attrs['complete'] = str(self.is_complete())
         else:
             ds.attrs['complete'] = str(complete)
 
-        tmp_file = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_file = Path(tmp.name)
+        directory = Path(tmp_dir) if tmp_dir is not None else file.parent
+        directory.mkdir(parents=True, exist_ok=True)
 
+        handle, name = tempfile.mkstemp(prefix=file.name + '.', suffix='.tmp', dir=str(directory))
+        os.close(handle)
+        tmp_file = Path(name)
+        try:
             if complevel>0:
                 encoding = {
                     self.variable: {"zlib": True, "complevel": complevel},
                 }
-                ds.to_netcdf(tmp_file, encoding=encoding, engine=self.ENGINE)
+                ds.to_netcdf(tmp_file, encoding=encoding, engine=engine or self.ENGINE)
             else:
-                ds.to_netcdf(tmp_file, engine=self.ENGINE)
+                ds.to_netcdf(tmp_file, engine=engine or self.ENGINE)
 
-            shutil.move(tmp_file, file)
+            if mode is not None:
+                os.chmod(tmp_file, mode)
+
+            os.replace(tmp_file, file)
         except Exception:
-            if tmp_file and tmp_file.exists():
+            if tmp_file.exists():
                 try:
                     tmp_file.unlink()
                 except Exception:
@@ -789,12 +1148,34 @@ class MeteoRaster(object):
             attrs={'units': self.units, 'variable': self.variable, 'saved': f'Saved by {self.__class__.__name__} v{self.VERSION} @ {pd.Timestamp.now().isoformat()}'},
         )
 
+        # Also record the leadtime format as an attribute on the leadtime
+        # variable. The scalar coordinate above only survives while xarray
+        # propagates dataset scalar coords onto extracted variables and the
+        # `coordinates` attribute stays intact; any tool that rewrites the file
+        # loses it, and DateOffset leadtimes then read back as bare integers.
+        data_array['leadtime'].attrs['leadtime_format'] = leadtime_format
+
         return data_array
     
     @classmethod
-    def load(cls, file, verbose=None) -> "MeteoRaster":
+    def load(cls, file, verbose=None, productions=None, leadtimes=None, dtype=None,
+             engine=None) -> "MeteoRaster":
         '''
         Loads a MeteoRaster from a NetCDF (.nc / .nct) file written by save().
+
+        Reading goes through meteoraster.io, which tries the available engines in
+        turn and pins the decoding choices that drift between xarray versions - so
+        a file written by another install reads back with the same dtypes. See
+        io.open_raster.
+
+        productions / leadtimes: read only part of the file. Accept indices, a
+            slice, or the coordinate values themselves.
+        dtype: cast while reading. The cube is filled one production at a time, so
+            dtype='float32' on a float64 file genuinely halves peak memory instead
+            of casting after the whole array is already resident.
+
+        For a file too large to hold at all, use io.iter_productions (or
+        MeteoRaster.iter_productions) and aggregate block by block.
         '''
 
         if not isinstance(file, Path):
@@ -810,46 +1191,30 @@ class MeteoRaster(object):
         if file.suffix.lower() not in {'.nc', '.nct'}:
             raise ValueError('Only NetCDF files written by save() are supported.')
 
-        with xr.open_dataset(file, engine=cls.ENGINE) as ds:
-            # pick the first data variable if name is unknown
-            var_name = cls.__detect_variable_name(ds)
-            da = ds[var_name]
+        data, production_datetime, leadtime_values, header = _io.read_cube(
+            file, productions=productions, leadtimes=leadtimes, dtype=dtype, engine=engine)
 
-            units = da.attrs.get('units', 'unknown')
-            variable = da.attrs.get('variable', 'unknown')
-            da_attrs = ds.attrs
-            ds_attrs = ds.attrs
-
-            leadtimes = ds['leadtime'].values
-            if hasattr(ds['leadtime'], 'leadtime_format'):
-                leadtime_format = str(ds['leadtime'].leadtime_format.values)
-                if leadtime_format.split(':')[0]=='pd.DateOffset':
-                    leadtimes = pd.Index([pd.DateOffset(**{leadtime_format.split(':')[1]: lt}) for lt in leadtimes])
-
-            meteo = cls(
-                data=da.values,
-                latitudes=ds['lat'].values,
-                longitudes=ds['lon'].values,
-                production_datetime=ds['production_datetime'].values,
-                leadtimes=leadtimes,
-                units=units,
-                variable=variable,
-                da_attrs=da_attrs,
-                ds_attrs=ds_attrs,
-                **kwargs,
-            )
+        meteo = cls(
+            data=data,
+            latitudes=header.latitudes,
+            longitudes=header.longitudes,
+            production_datetime=production_datetime,
+            leadtimes=leadtime_values,
+            units=header.units,
+            variable=header.variable,
+            # These were both bound to ds.attrs, so the DataArray attributes were
+            # lost and _update_attrs' write leaked into the global attributes -
+            # every load/save cycle accreted `units` and `variable` there.
+            da_attrs=dict(header.da_attrs),
+            ds_attrs=dict(header.ds_attrs),
+            **kwargs,
+        )
 
         cls._diag('    Loaded.', verbose)
 
         return meteo
 
-    @staticmethod
-    def __detect_variable_name(ds: xr.Dataset) -> str:
-        # Require single-variable datasets written by save()
-        if len(ds.data_vars) != 1:
-            raise ValueError('NetCDF file must contain exactly one data variable written by save().')
-        return next(iter(ds.data_vars))
-    
+
     def copy(self):
         '''
         Makes a copy of a MeteoRaster file
@@ -906,336 +1271,220 @@ class MeteoRaster(object):
         eastIndexes = np.arange(len(self.longitudes))[self.longitudes<=180]
 
         longitudes = np.concatenate((self.longitudes[westIndexes]-360, self.longitudes[eastIndexes]))
-        
-        westData = self.data[:, :, : ,: ,westIndexes]
-        eastData = self.data[:, :, : ,: ,eastIndexes]
-        
-        data = np.concatenate((westData, eastData), axis=-1)
-        
+
+        # np.roll when the two halves are contiguous blocks, which is the usual
+        # 0..360 layout: it produces one array instead of two fancy-indexed halves
+        # plus the concatenation of them (3x peak for the largest array we hold).
+        contiguous = (westIndexes.size and eastIndexes.size
+                      and np.array_equal(westIndexes, np.arange(westIndexes[0], westIndexes[-1] + 1))
+                      and np.array_equal(eastIndexes, np.arange(eastIndexes[0], eastIndexes[-1] + 1))
+                      and eastIndexes[-1] + 1 == westIndexes[0])
+        if contiguous:
+            data = np.roll(self.data, westIndexes.size, axis=-1)
+        else:
+            data = np.concatenate((self.data[..., westIndexes], self.data[..., eastIndexes]), axis=-1)
+
         self.longitudes = longitudes
         self.data = data
-        
+
         self._diag('Fixed start at Greenwich.', self.verbose)
     
-    def __groupByMatrix(self, coverage, columns, elementwise=False):
+    def __groupByCoverage(self, coverage, min_coverage):
         '''
-        Groups the data by a coverage matrix (see groupByKML for matrix definition)
+        Area-weighted mean per zone, from a zonal.Coverage.
+
+        Replaces __groupByMatrix, which densified the coverage to
+        [1, 1, 1, y, x, zone] and then tiled it up to the full cube shape once per
+        zone - the reason it needed explicit gc.collect() calls.
         '''
-        
+
         self._diag('Executing spatial aggregation...', self.verbose)
 
-        #Verification of valid tiles (assumes first coverage zone to be representative (for speed and memory)
-        val_ = np.isfinite(self.data).astype(bool)
-        cvr = np.tile(coverage[:, :, :, :, :, 0].astype(np.single), list(val_.shape[:(val_.ndim-2)]) + [1, 1])
-        val = np.nansum(cvr*val_, axis=(-2, -1))>0.8
-        val = np.tile(np.expand_dims(val,-1), [1]*val.ndim + [coverage.shape[-1]])
+        agg = _zonal.apply_coverage(coverage, self.data, min_coverage=min_coverage)
 
-        if elementwise:
-            agg = np.empty(list(self.data.shape[:3]) + [len(columns)]).astype(np.single) * np.nan
-            
-            data_single = self.data.astype(np.single)
-            coverage_single = coverage.astype(np.single)
-            
-            for i0 in range(len(columns)):
-                agg[:, :, :, i0] = np.nansum(data_single * np.tile(coverage_single[:, :, :, :, :, i0], list(data_single.shape[:(self.data.ndim-2)]) + [1, 1]), axis=(-2, -1))
-                self._diag('    % 5.1f%%' % ((i0+1)/len(columns)*100), self.verbose)
-        else:
-            #Creation of matrices for calculation
-            dat = np.tile(np.expand_dims(self.data.astype(np.single), axis=-1), [1]*self.data.ndim + [coverage.shape[-1]])
-            cvr = np.tile(coverage.astype(np.single), list(dat.shape[:(dat.ndim-3)]) + [1, 1, 1])
-            
-            #Correction of the coveragefor missing data
-            dat_finite = np.isfinite(dat).astype(bool)
-            cvr_finite = cvr.copy()
-            cvr_finite[~dat_finite] = 0
-            weight_update = 1 / cvr_finite.sum(axis=(-3, -2))
-            weight_update = np.tile(weight_update[:, :, :, np.newaxis, np.newaxis, :], [1, 1, 1] + list(cvr.shape[-3:-1]) + [1])
+        # F-order flattens with ensemble_member fastest and zone slowest, which is the
+        # order from_product declares below.
+        flat = np.reshape(agg, (agg.shape[0], int(np.prod(agg.shape[1:]))), order='F')
+        frame = pd.DataFrame(flat, index=np.asarray(self.production_datetime).ravel())
+        frame.columns = pd.MultiIndex.from_product(
+            (coverage.zones, self.leadtimes,
+             np.arange(self.data.shape[self.ENSEMBLEMEMBERpOSITION])),
+            names=('zone', 'leadtime', 'ensemble_member'))
 
-            dat *= cvr 
-            dat *= weight_update 
+        for name in ('leadtime', 'ensemble_member'):
+            if frame.columns.get_level_values(name).nunique() == 1:
+                self._diag('    Level %s is redundant and will be dropped.' % name, self.verbose)
+                frame.columns = frame.columns.droplevel(name)
 
-            cvr = None
-            gc.collect()
-            
-            #Calculation with garbage collection
-            agg = np.nansum(dat, axis=(-3, -2))
-            dat = None
-            gc.collect()
-            
-        #Mark invalid tiles as NaN
-        agg[~val] = np.nan 
-        
-        tmp = np.reshape(agg, (agg.shape[0], np.prod(agg.shape[1:])), order='F')
-        agg = pd.DataFrame(tmp, index=self.production_datetime.ravel())
-        agg.columns = columns
+        frame.index.name = 'Production date'
+
+        self._diag('    Done.', self.verbose)
+
+        return frame
+
+
+    POOLABLE_AXES = ('space', 'leadtime', 'production', 'members')
+
+    #: ensemble_member label used when the members are pooled into the sample.
+    POOLED_MEMBER = -1
+
+    def __time_blocks(self, values, resampling, pooled):
+        '''
+        Returns (groups, labels) for one time axis.
+
+        Each group is the positional indices pooled into a single distribution.
+        When the axis is not pooled every position is its own group, so the axis
+        survives in the columns unchanged.
+        '''
+
+        count = len(values)
+        if not pooled:
+            return [[i] for i in range(count)], list(values)
+
+        if resampling is None:
+            # The whole axis is one block; the level then drops out as redundant.
+            return [list(range(count))], [values[0]]
+
+        index = pd.Index(values)
+
+        if isinstance(index, pd.DatetimeIndex):
+            # resample() rather than floor() so calendar rules ('MS', 'W', 'QS')
+            # work as well as fixed ones ('1D', '6h').
+            grouped = pd.Series(np.arange(count), index=index).resample(resampling)
+            blocks = [(label, np.asarray(positions))
+                      for label, positions in grouped.indices.items()]
+            blocks.sort(key=lambda item: item[0])
+
+            return [list(positions) for _, positions in blocks], [label for label, _ in blocks]
+
+        if not isinstance(index, pd.TimedeltaIndex):
+            try:
+                index = pd.TimedeltaIndex(index)
+            except (TypeError, ValueError) as ex:
+                raise TypeError('Cannot pool this axis with resampling=%r: its values are %s, '
+                                'not timedeltas. Calendar-month leadtimes (pd.DateOffset) have '
+                                'no fixed length, so pool the whole axis with resampling=None '
+                                'instead.' % (resampling, index.dtype)) from ex
+
+        keys = index.floor(resampling)
+        groups, labels = [], []
+        for key in pd.Index(keys).unique().sort_values():
+            groups.append(list(np.flatnonzero(np.asarray(keys) == key)))
+            labels.append(key)
+
+        return groups, labels
+
+    def __groupByQuantile(self, coverage, resampling, quantiles, pool, min_coverage, method):
+        '''
+        Area-weighted spatial quantiles per zone, optionally pooling a time axis.
+        '''
+
+        self._diag('Executing spatial aggregation...', self.verbose)
+
+        pool = {str(p).lower() for p in ([pool] if isinstance(pool, str) else pool)}
+        unknown = pool - set(self.POOLABLE_AXES)
+        if unknown:
+            raise ValueError('Unknown pool axes: %s. Choose from %s.'
+                             % (', '.join(sorted(unknown)), ', '.join(self.POOLABLE_AXES)))
+        if 'space' not in pool:
+            raise ValueError("pool must include 'space': these are spatial quantiles over the "
+                             "cells of each zone.")
+
+        quantiles = np.atleast_1d(np.asarray(quantiles, dtype=float))
+        members = np.arange(self.data.shape[self.ENSEMBLEMEMBERpOSITION])
+
+        production_groups, production_labels = self.__time_blocks(
+            self.production_datetime, resampling, 'production' in pool)
+        leadtime_groups, leadtime_labels = self.__time_blocks(
+            self.leadtimes, resampling, 'leadtime' in pool)
+
+        pool_axes = []
+        if 'production' in pool:
+            pool_axes.append(0)
+        if 'members' in pool:
+            pool_axes.append(1)
+        if 'leadtime' in pool:
+            pool_axes.append(2)
+
+        # Kept leading axes, in order. Production and leadtime are singletons here
+        # whenever they are not pooled (each group holds one position), so they are
+        # squeezed away and their labels come from the block instead.
+        kept = [axis for axis in (0, 1, 2) if axis not in pool_axes]
+        squeeze = tuple(position for position, axis in enumerate(kept) if axis in (0, 2))
+        member_labels = [self.POOLED_MEMBER] if 'members' in pool else list(members)
+
+        frames = []
+        for leadtime_group, leadtime_label in zip(leadtime_groups, leadtime_labels):
+            block = np.empty((len(production_groups), len(member_labels),
+                              quantiles.size, len(coverage)))
+            for row, production_group in enumerate(production_groups):
+                values = self.data[np.asarray(production_group)][:, :, np.asarray(leadtime_group)]
+                computed = _zonal.quantiles_from_coverage(
+                    coverage, values, quantiles, pool_axes=pool_axes,
+                    min_coverage=min_coverage, method=method)
+                if squeeze:
+                    computed = np.squeeze(computed, axis=squeeze)
+                block[row] = computed.reshape(len(member_labels), quantiles.size, len(coverage))
+
+            # C-order flatten of (member, quantile, zone) varies zone fastest, which
+            # is the order from_product below declares. The leadtime level is a
+            # size-1 axis inserted between them and does not affect the ordering.
+            frame = pd.DataFrame(block.reshape(len(production_groups), -1), index=production_labels)
+            frame.columns = pd.MultiIndex.from_product(
+                (member_labels, [leadtime_label], quantiles, coverage.zones),
+                names=('ensemble_member', 'leadtime', 'quantile', 'zone'))
+            frames.append(frame)
+
+        agg = pd.concat(frames, axis=1)
+        agg = agg.reorder_levels(['zone', 'leadtime', 'ensemble_member', 'quantile'], axis=1)
+
+        # Drop redundant levels, as __groupByMatrix does, but always keep zone and
+        # quantile - they are what the caller asked for.
+        for name in ('leadtime', 'ensemble_member'):
+            if agg.columns.get_level_values(name).nunique() == 1:
+                self._diag('    Level %s is redundant and will be dropped.' % name, self.verbose)
+                agg.columns = agg.columns.droplevel(name)
+
+        agg = agg.sort_index(axis=1)
         agg.index.name = 'Production date'
 
         self._diag('    Done.', self.verbose)
 
-        return agg  
-    
-    def __groupByQuantile(self, coverage, columns, resampling, quantiles, precision=0.1):
-        '''
-        Groups the data by quantiles in time and space
-        
-        precision should be between 0 and 1.
-        computation time will be proportional to 1/precision
-        '''
-        
-        self._diag('Executing spatial aggregation...', self.verbose)
+        return agg
 
-        if not resampling is None:
-            resampled_idx = pd.DataFrame(self.production_datetime, self.production_datetime).resample(resampling).indices
-            time_idx = list(resampled_idx.keys())
-            time_groups = [i for _, i in resampled_idx.items()]
-        else:
-            time_idx = self.production_datetime
-            time_groups = [[i] for i, _ in enumerate(time_idx)]
-                    
-        #Creation of matrices for calculation
-        dat = np.tile(np.expand_dims(self.data.astype(np.single), axis=-1), [1]*self.data.ndim + [coverage.shape[-1]])
-        coverage_ = coverage.astype(np.single)
-        coverage_[coverage_==0] = np.nan
-        gc.collect()
-        
-        #Calculation with garbage collection
-        agg_ = []
-        for g0 in time_groups:
-            data = dat[g0,:, :, :, :].copy()
-            
-            # Verification of valid tiles (assumes first coverage zone to be representative (for speed and memory)
-            cvr = np.tile(coverage_, list(data.shape[:(dat.ndim-3)]) + [1, 1, 1])
-            val = cvr.copy()
-            val[val<=0] = np.nan
-            val[val>0] = 1
 
-            data_ = data * val
-            
-            folds = np.round(cvr/precision)
-            n_folds = int(np.nanmax(folds))
-            data_unfolded = np.tile(np.expand_dims(data, 0), [n_folds] + [1] * data.ndim) * np.nan
-            tmp = data_.copy()
-            for i1 in range(n_folds):
-                tmp[folds<i1+1] = np.nan
-                data_unfolded[i1,:,:,:,:,:,:] = tmp 
-           
-            # Check what pixels are valid (more than 80% values available)
-            val = np.nansum(np.isfinite(data_), axis=(0, -3, -2)) / np.nansum(np.isfinite(val), axis=(0, -3, -2)) > 0.8
-            val = np.tile(np.expand_dims(val, (0, -1)), [1]*(val.ndim + 1) + [len(quantiles)])
-            
-            # Calculate the quantiles
-            raise(Exception('This must be reviewed.'))
-            tmp = np.rollaxis(np.nanquantile(np.expand_dims(data_unfolded, 0), quantiles, axis=(1, 2, -3, -2)), 0, len(quantiles)) #[time, lead, ensemble, zones, quantiles]
-            tmp[~val] = np.nan 
-            agg_.append(tmp)
-    
-        agg__ = np.r_[agg_] 
-                
-        tmp = np.reshape(agg__, (agg__.shape[0], np.prod(agg__.shape[1:])), order='F')
-        agg = pd.DataFrame(tmp, index=time_idx)
-        
-        tmp = pd.concat([columns.to_frame()]*len(quantiles))
-        tmp.loc[:, 'Quantile'] = np.array([[q]*np.prod(agg__.shape[1:-1]) for q in quantiles]).ravel()
-        agg.columns = pd.MultiIndex.from_frame(tmp)
-        agg.index.name = 'Production date'
-        agg.sort_index(axis=1, inplace=True)
 
-        #=======================================================================
-        # agg.to_clipboard(excel=True)
-        #=======================================================================
-
-        self._diag('    Done.', self.verbose)
-
-        return agg  
-    
-    def __coverageMatrixFromKML(self, kml, nameField=None, buffer=2, normalize_by_area=True):
+    @staticmethod
+    def _as_slice(indices):
         '''
-        Creates a coverage matrix from polygons contained in a kml file
-        '''
-        
-        self._diag('Creating a coverage matrix for spatial aggregation...', self.verbose)
-        
-        # Correct kml file if required
-        self.__correctKMLHeader(kml) 
-        
-        # Read geometry reference KML file
-        ids = []
-        coordinates = []
-        document = et.parse(kml).getroot().find('Document')
-        for i0, placemark in enumerate(document.findall('.//Placemark')):
-            #https://docs.python.org/3/library/xml.etree.elementtree.html
-            try:
-                if not isinstance(nameField, type(None)):
-                    id0 = placemark.find(".//SimpleData[@name='%s']" % nameField).text
-                else:
-                    id0 = str(i0)
-                outer = [pd.Series(c.text.replace(' \n', '').replace('\n', '').replace('\t', '').split(' ')).str.split(',', n=2, expand=True) for c in placemark.findall('.//Polygon/outerBoundaryIs//coordinates')]
-                outer = [c.astype(float) for c in outer]
-                inner = [pd.Series(c.text.replace(' \n', '').replace('\n', '').replace('\t', '').split(' ')).str.split(',', n=2, expand=True) for c in placemark.findall('.//Polygon/innerBoundaryIs//coordinates')]
-                inner = [c.astype(float) for c in inner]
-                ids.append(id0)
-                coordinates.append({'outer': outer, 'inner': inner})
-            except Exception as ex:
-                print(str(ex)) 
-        
-        cvr = np.zeros([1, 1, 1] + list(self.data.shape[3:]) + [len(ids)], dtype=np.single) # the last coordinate of the cvr represents the polygon
-        
-        longitudes = self.longitudes
-        latitudes = self.latitudes
-        idx_lat_ = np.tile(np.expand_dims(np.arange(longitudes.shape[0]),axis=1),(1, longitudes.shape[1])).ravel() 
-        idx_lon_ = np.tile(np.arange(longitudes.shape[1]),(longitudes.shape[0], 1)).ravel()
-        lonInterpolator = interp.LinearNDInterpolator(np.array([idx_lat_, idx_lon_]).T, longitudes.ravel()) # f(lat_id, lon_id)
-        latInterpolator = interp.LinearNDInterpolator(np.array([idx_lat_, idx_lon_]).T, latitudes.ravel()) # f(lat_id, lon_id)
-        
-        # Create GDAL geometry
-        centroids = {'x':[], 'y':[]}
-        for i0, coords in enumerate(coordinates):
-            try:
-                # Add all "positive" rings
-                poly = ogr.Geometry(ogr.wkbPolygon)
-                for o1 in coords['outer']:
-                    for r0 in o1:
-                        polyTmp = ogr.Geometry(ogr.wkbPolygon)
-                        ring = ogr.Geometry(ogr.wkbLinearRing)
-                        for row in o1.iterrows():
-                            ring.AddPoint(row[1][0], row[1][1])
-                        _ = polyTmp.AddGeometry(ring)
-                        poly = poly.Union(polyTmp)
-                
-                # Join all "negative rings
-                polyHoles = ogr.Geometry(ogr.wkbPolygon)
-                for o1 in coords['inner']:
-                    for r0 in o1:
-                        polyTmp = ogr.Geometry(ogr.wkbPolygon)
-                        ring = ogr.Geometry(ogr.wkbLinearRing)
-                        for row in o1.iterrows():
-                            ring.AddPoint(row[1][0], row[1][1])
-                        _ = polyTmp.AddGeometry(ring)
-                        polyHoles = polyHoles.Union(polyTmp)
-                    
-                # Obtain the final polygon
-                poly = poly.SymmetricDifference(polyHoles)
-    
-                # Select pixel subset
-                #===============================================================
-                # plt.figure(); plt.imshow(longitudes); plt.colorbar()
-                # plt.figure(); plt.imshow(latitudes); plt.colorbar()
-                # plt.figure(); plt.scatter(longitudes.ravel(), latitudes.ravel(),c=self.data.squeeze().mean(axis=0).ravel()); plt.colorbar()
-                # plt.figure(); plt.scatter(longitudes.ravel(), latitudes.ravel(),c=longitudes.ravel()); plt.colorbar()
-                # plt.figure(); plt.scatter(longitudes.ravel(), latitudes.ravel(),c=latitudes.ravel()); plt.colorbar()
-                #===============================================================
-                
-                extent = poly.Buffer(buffer).GetEnvelope() #wesn
-                inside = np.zeros_like(latitudes).astype(bool)
-                inside[(longitudes>=extent[0]) & (longitudes<=extent[1]) & (latitudes>=extent[2]) & (latitudes<=extent[3])] = True
-                tmp = np.where(inside)
-                lat_idxs = np.arange(tmp[0].min()-1, tmp[0].max()+1)
-                lat_idxs = lat_idxs[(lat_idxs>0) & (lat_idxs<latitudes.shape[0]-1)]
-                lon_idxs = np.arange(tmp[1].min()-1, tmp[1].max()+1)
-                lon_idxs = lon_idxs[(lon_idxs>0) & (lon_idxs<longitudes.shape[1]-1)]
-                
-                #===============================================================
-                # plt.figure(); plt.imshow(inside); plt.colorbar()
-                # plt.figure(); plt.scatter(longitudes.ravel(), latitudes.ravel(),c=inside.ravel()); plt.colorbar()
-                #===============================================================
-                
-                #===============================================================
-                # extent = [extent[0]-hdLon*2, extent[1]+hdLon*2, extent[2]-hdLat*2, extent[3]+hdLat*2]
-                # lon_idxs = np.arange(self.longitudes.shape[0])[(self.longitudes>=extent[0]) & (self.longitudes<=extent[1])]
-                # lat_idxs = np.arange(self.latitudes.shape[0])[(self.latitudes>=extent[2]) & (self.latitudes<=extent[3])]
-                #===============================================================
-    
-                x, y, _ = poly.Centroid().GetPoint()
-                centroids['x'].append(x)
-                centroids['y'].append(y)
-    
-                for i2 in lon_idxs:
-                    for i3 in lat_idxs:
-                        #=======================================================
-                        # lon = self.longitudes[i3, i2]
-                        # lat = self.latitudes[i3, i2]
-                        # plt.plot(lon, lat, 'rx')
-                        # plt.plot(lonInterpolator(i3-0.5,i2+0.5), latInterpolator(i3-0.5,i2+0.5), '.m')
-                        #=======================================================
-                        
-                        points = []
-                        points.append((float(lonInterpolator(i3-0.5, i2+0.5)), float(latInterpolator(i3-0.5, i2+0.5))))
-                        points.append((float(lonInterpolator(i3+0.5, i2+0.5)), float(latInterpolator(i3+0.5, i2+0.5))))
-                        points.append((float(lonInterpolator(i3+0.5, i2-0.5)), float(latInterpolator(i3+0.5, i2-0.5))))
-                        points.append((float(lonInterpolator(i3-0.5, i2-0.5)), float(latInterpolator(i3-0.5, i2-0.5))))
-                        points.append((float(lonInterpolator(i3-0.5, i2+0.5)), float(latInterpolator(i3-0.5, i2+0.5))))
-                        
-                        ring = ogr.Geometry(ogr.wkbLinearRing)
-                        for p in points:
-                            ring.AddPoint(*p)
-                            #===================================================
-                            # plt.plot(*p,'.b')
-                            #===================================================
-                        
-                        pixel = ogr.Geometry(ogr.wkbPolygon)
-                        _ = pixel.AddGeometry(ring)
-    
-                        intersection = pixel.Intersection(poly)
-                        area = intersection.Area()
-    
-                        if area>0:
-                            cvr[0, 0, 0, i3, i2, i0] = area
-            except Exception as ex:
-                raise(ex)
+        Returns an equivalent slice when `indices` is a contiguous ascending run,
+        otherwise the array itself.
 
-        # Define columns (drops redundant levels (except zone))
-        columns = pd.MultiIndex.from_product((ids, self.leadtimes, 1+np.arange(self.data.shape[self.ENSEMBLEMEMBERpOSITION])), names=('zone', 'leadtime', 'ensemble_member'))
-        drop = []
-        for i0, (n0, l0) in enumerate(zip(columns.names, list(columns.levels))):
-            if l0.shape[0]==1 and n0!='Zone':
-                self._diag('    Level %s is redundant and will be dropped.' % n0, self.verbose)
-                drop.append(i0)
-        for i0 in drop[::-1]:
-            columns = columns.droplevel(i0)
-                
-        # Normalize
-        if normalize_by_area:
-            areas = cvr.sum(axis=(0, 1, 2, 3, 4))
-            cvr /= np.tile(areas, list(cvr.shape[:-1]) + [1])
-        else:
-            max_pixel_area = cvr.max(axis=tuple(np.arange(cvr.ndim-1)))
-            cvr /= np.tile(max_pixel_area, list(cvr.shape[:-1]) + [1])
-        
-        # Prepare centroids for export
-        centroids = pd.DataFrame(centroids, index=ids)
-        
-        self._diag('    Done.', self.verbose)
-        
-        return cvr, columns, centroids
-        
-    def __correctKMLHeader(self, kml, encoding='utf-8'):
+        Slicing gives a view where fancy indexing would copy, which is what keeps
+        get_cropped down to a single allocation.
         '''
-        Corrects the header of a KML file to that it can be read for model data preparation
+
+        indices = np.asarray(indices)
+        if indices.size and np.array_equal(indices, np.arange(indices[0], indices[-1] + 1)):
+            return slice(int(indices[0]), int(indices[-1]) + 1)
+
+        return indices
+
+    @staticmethod
+    def _nan_filled(shape, dtype):
         '''
-        
-        modificationRequired = False
-        line = ''
-        with open(kml, 'r', encoding=encoding) as file:
-            for line in file:
-                if line.strip().startswith('<kml'):
-                    if line.strip() != '<kml>':
-                        modificationRequired = True
-                    break
-                
-        if modificationRequired:
-            if not isinstance(kml, str):
-                kml = str(kml)
-                
-            tmpKML = kml.replace('.kml', '__tmp.kml')
-            with open(kml, 'r', encoding=encoding) as file_in:
-                with open(tmpKML, 'w', encoding=encoding) as file_out:
-                    for line in file_in:
-                        if line.strip().startswith('<kml'):
-                            if line.strip() != '<kml>':
-                                line = '<kml>\n'
-                        __ = file_out.write(line)
-            os.remove(kml)
-            os.rename(tmpKML, kml)
+        Allocates a NaN-filled array, keeping dtype when it can hold NaN.
+
+        `np.empty(shape) * np.nan` is float64 whatever the source dtype, so a
+        float32 raster was silently doubled in memory - and on disk after the next
+        save(), since save() writes whatever dtype it is handed.
+        '''
+
+        dtype = np.dtype(dtype)
+        if not np.issubdtype(dtype, np.floating):
+            dtype = np.result_type(dtype, np.float32)
+
+        return np.full(tuple(shape), np.nan, dtype=dtype)
 
     @staticmethod
     def _diag(message, show=True):

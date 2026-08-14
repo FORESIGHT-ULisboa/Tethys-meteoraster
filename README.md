@@ -20,12 +20,19 @@ Its core data structure, `MeteoRaster`, holds a single **5-D** array indexed by
 wraps it with everything you need to turn raw reanalysis/forecast files into
 report-ready time series, maps and aggregated statistics:
 
-- read ERA5, ERA5-Land, GFS, C3S (seasonal) and CORDEX files into a common model,
+- read ERA5-Land GRIB (monthly means and hourly, with de-accumulation) into a common model,
 - crop, join, trim, resample and check the completeness of the data,
 - extract point time series or **catchment/zone aggregates from KML polygons**
-  (area-weighted, missing-data aware),
-- persist to compressed NetCDF (`h5netcdf`) and reload losslessly,
+  (area-weighted, missing-data aware), as means or as exact weighted quantiles,
+- persist to compressed NetCDF (`h5netcdf`) and reload losslessly — with a read
+  path that survives an install on a different xarray,
+- **stream a file too large to hold in memory**, one production at a time,
 - and plot means, seasonal cycles, coordinates and availability with `cartopy`.
+
+Only `numpy`, `scipy`, `pandas`, `xarray`, `h5netcdf` and `h5py` are needed to read,
+write, subset and aggregate. GDAL, matplotlib, seaborn and cartopy are imported the
+moment you use them, so `import meteoraster` works in a slim container that has
+none of them.
 
 ---
 
@@ -34,26 +41,34 @@ report-ready time series, maps and aggregated statistics:
 | Category | What you get |
 |---|---|
 | **Data model** | `MeteoRaster` — 5-D `[production_datetime, ensemble_member, leadtime, lat, lon]`; 2-D lat/lon grids; automatic Greenwich (0–360 → −180–180) fix and latitude flip |
-<!-- | **Format readers** | `readERA5_monthly`, `readERA5Land_monthly`, `read_ERA5Land_hourly`, `read_GFS`, `read_C3S`, `readCORDEX_monthly` | -->
+| **Format readers** | `meteoraster.utils` — `readERA5Land_monthly`, `read_ERA5Land_hourly` (GRIB via `cfgrib`) |
 | **Subsetting / merging** | `get_cropped`, `join`, `trim`, `adjust_leadtimes` |
 | **Resampling** | `resample_timestep` (pandas rules) and the standalone `Resample` class |
-| **Extraction** | `get_values_from_latlon`, `get_values_from_KML`, `get_quantiles_from_KML`*, `get_values_from_latlon_by_event` |
-| **Spatial aggregation** | area-weighted coverage matrices from KML polygons, missing-data aware |
+| **Extraction** | `get_values_from_latlon`, `get_values_from_KML`, `get_quantiles_from_KML`, `get_values_from_latlon_by_event` |
+| **Spatial aggregation** | `meteoraster.zonal` — sparse coverage by exact fractional overlap, area-weighted means and quantiles, missing-data aware per zone |
 | **Quality / diagnostics** | `is_complete`, `get_complete_index`, `get_missing`, `get_completeness` |
-| **I/O** | `save` / `load` (compressed NetCDF via `h5netcdf`), `to_xarray` |
+| **I/O** | `save` / `load` (compressed NetCDF via `h5netcdf`), `to_xarray`, and `meteoraster.io` for header-only and streaming reads |
 | **Visualisation** | `plot_mean`, `plot_mean_projected`, `plot_seasonal`, `plot_coordinates`, `plot_availability`, `add_shapefile`, `add_shape` |
-
-\* `get_quantiles_from_KML` is currently under review and not functional — see
-[AGENTS.md](AGENTS.md).
 
 ---
 
 ## Installation
 
-`meteoraster` relies on a geospatial stack (**GDAL/`osgeo`**, `cartopy`, `cfgrib`)
-that is most reliably installed with **conda**. Two paths follow: install the
-**released package from PyPI** on top of a conda environment (use the package), or
-install **from source** (develop / run the tests).
+The **core** — reading, writing, subsetting, streaming and aggregating — needs only
+`numpy`, `scipy`, `pandas`, `xarray`, `h5netcdf` and `h5py`, all pip-installable:
+
+```bat
+pip install meteoraster
+```
+
+The **geospatial and plotting extras** (**GDAL/`osgeo`**, `cartopy`, `cfgrib`) are
+most reliably installed with **conda**, and are imported only when used. Zonal
+aggregation from KML or PostGIS geometry needs GDAL; the map plots need cartopy.
+`import meteoraster` works without either — a missing one raises at the call site
+with the command to install it.
+
+Two paths follow: install the **released package from PyPI** on top of a conda
+environment (use the package), or install **from source** (develop / run the tests).
 
 ### A · Install from PyPI
 
@@ -71,15 +86,17 @@ the newest release.
 
 > The package declares its pure-Python dependencies, but **GDAL is intentionally
 > not** a pip dependency (it is a system/conda package). The conda environment
-> above provides it. If you only need the point/plotting features and already
-> have GDAL, you can `pip install meteoraster` into any environment.
+> above provides it. If you do not need zonal aggregation from vector geometry,
+> `pip install meteoraster` into any environment is enough — including a slim
+> container image, where `import meteoraster`, `save`, `load` and the streaming
+> readers all work with no GDAL, cartopy, matplotlib or seaborn present.
 
 Every release is also attached to the
 [GitHub releases page](https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases),
 which is useful to pin an exact build without going through PyPI:
 
 ```bat
-pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v2.5/meteoraster-2.5-py3-none-any.whl
+pip install https://github.com/FORESIGHT-ULisboa/Tethys-meteoraster/releases/download/v3.0/meteoraster-3.0-py3-none-any.whl
 ```
 
 ### B · Install from source (development)
@@ -127,14 +144,29 @@ mr = MeteoRaster(
 
 ### Read a real dataset
 
-The readers live in `meteoraster.utils` and return a ready-to-use `MeteoRaster`:
+The ERA5-Land readers live in `meteoraster.utils` and return a ready-to-use
+`MeteoRaster`:
 
 ```python
-from meteoraster.utils import readERA5Land_monthly, read_C3S
+from meteoraster.utils import readERA5Land_monthly, read_ERA5Land_hourly
 
-era5 = readERA5Land_monthly("era5land_tp.grib", "tp")   # total precipitation
-c3s  = read_C3S("seasonal_t2m.grib", "t2m")             # seasonal 2 m temperature
+# monthly means: tp comes back as mm/month, t2m as degC
+era5 = readERA5Land_monthly("era5land_monthly.grib", "tp")
+
+# hourly: accumulations are de-accumulated to per-hour increments (mm/hr).
+# A CDS request omits the last hour of its final day - it is delivered with the
+# next period, so pass that file to fill it in.
+hourly = read_ERA5Land_hourly("era5land_2025_11.grib", "tp",
+                              file_next_year="era5land_2025_12.grib")
 ```
+
+These need `cfgrib` and the ecCodes binary. On Windows ecCodes lives in
+`<env>/Library/bin` and is only found through `PATH`, so **activate** the conda
+environment rather than calling its `python.exe` directly — otherwise `import cfgrib`
+raises `RuntimeError: Cannot find the ecCodes library`.
+
+Anything already converted by Tethys needs no reader — `MeteoRaster.load` reads it
+directly.
 
 ### Extract a point time series
 
@@ -151,6 +183,39 @@ ts = mr.get_values_from_latlon(lat=35.0, lon=0.0)
 agg, centroids = mr.get_values_from_KML("zones.kml", nameField="zone_id")
 ```
 
+Spatial **quantiles** over the same zones, area-weighted so a cell half inside a
+zone carries half the probability mass:
+
+```python
+agg, centroids = mr.get_quantiles_from_KML("zones.kml", nameField="zone_id",
+                                           quantiles=[0.1, 0.5, 0.9])
+
+# Pool an hourly forecast into one distribution per day. `pool` names the axis
+# explicitly because "time" is the leadtime axis for a forecast and the production
+# axis for an observation raster - the event time is production + leadtime.
+agg, _ = mr.get_quantiles_from_KML("zones.kml", nameField="zone_id",
+                                   pool=("space", "leadtime"), resampling="1D")
+```
+
+The coverage is reusable, and the lower-level API needs no `MeteoRaster` at all —
+useful for caching it, or for feeding geometry straight out of PostGIS:
+
+```python
+from meteoraster import zonal
+
+coverage = zonal.coverage_from_kml("zones.kml", mr.latitudes, mr.longitudes,
+                                   name_field="zone_id")
+means = zonal.apply_coverage(coverage, mr.data)      # [..., y, x] -> [..., zone]
+
+coverage.save("coverage.npz")                        # pickle-free
+coverage = zonal.Coverage.load("coverage.npz")
+assert coverage.matches(mr.latitudes, mr.longitudes) # fingerprints the coordinates
+
+# WKB bytes or WKT work too, so PostGIS geometry needs no intermediate file
+coverage = zonal.coverage_from_geometries(mr.latitudes, mr.longitudes,
+                                          [feature.geom.wkb], ["basin"])
+```
+
 ### Crop, save and reload
 
 ```python
@@ -160,6 +225,37 @@ sub = mr.get_cropped(from_lat=32, to_lat=38, from_lon=-2, to_lon=7,
 sub.save("forecast.nc")                 # compressed NetCDF (h5netcdf)
 reloaded = MeteoRaster.load("forecast.nc")
 ```
+
+### Read a file that does not fit in memory
+
+`load()` holds the whole cube. For a large archive, read the metadata first and
+then stream one production at a time — peak memory is one block whatever the file
+size (measured 126 MB against 467 MB for `load()` on a 352 MB cube):
+
+```python
+from meteoraster import io as mrio, zonal
+
+header = mrio.read_header("archive.nct")        # coordinates, shape, units; no values
+print(header.shape, header.n_leadtimes, header.complete)
+
+coverage = zonal.coverage_from_kml("zones.kml", header.latitudes, header.longitudes,
+                                   name_field="zone_id")
+
+for production, block in mrio.iter_productions("archive.nct", reduce_members="mean"):
+    series = zonal.apply_coverage(coverage, block)   # [leadtime, zone]
+```
+
+`load()` also takes a subset directly, and casting on the way in genuinely halves
+peak memory for a float64 file rather than casting after it is already resident:
+
+```python
+mr = MeteoRaster.load("archive.nct", leadtimes=slice(0, 6), dtype="float32")
+```
+
+Reads try `h5netcdf`, then `netcdf4`, then `scipy`, and pin the decoding so a file
+written by another install returns the same dtypes. If HDF5 locking fails on a
+network share or a bind mount, set `HDF5_USE_FILE_LOCKING=FALSE` in the
+environment; the library will not set it for you.
 
 ### Resample in time
 
@@ -192,9 +288,14 @@ Tethys-meteoraster/
 ├── meteoraster/
 │   ├── __init__.py            # exports MeteoRaster, Resample
 │   ├── meteoraster.py         # MeteoRaster core class
+│   ├── io.py                  # portable NetCDF reads: header-only and streaming
+│   ├── zonal.py               # sparse coverage, area-weighted means and quantiles
 │   ├── resample.py            # Resample (time-step resampling of DataFrames)
-│   └── utils.py               # ERA5 / ERA5-Land / GFS / C3S / CORDEX readers
+│   ├── _lazy.py               # on-demand GDAL / matplotlib / seaborn / cartopy
+│   └── utils.py               # ERA5-Land GRIB readers
 ├── tests/                     # pytest suite + fixtures (conftest.py)
+│   └── resources/             # real GRIB/NetCDF inputs (see PROVENANCE.md)
+├── tools/make_fixtures.py     # regenerates the subsetted test fixtures
 ├── images/foresight.png       # README header
 ├── environment.yml            # conda environment (tethys_rasters)
 ├── pyproject.toml             # packaging + pytest configuration
@@ -218,10 +319,19 @@ pip install -e ".[dev]"
 pytest -ra
 ```
 
-The suite covers construction, cropping, point/KML extraction, NetCDF
-round-trips, completeness checks, resampling and the deprecated-alias warnings.
-Tests that need real GRIB/NetCDF inputs (the format readers) are out of scope and
-not included.
+The suite covers construction, cropping, point/KML extraction, NetCDF round-trips,
+completeness checks, resampling and the deprecated-alias warnings. Since v3.0 it also
+runs against **real inputs** in `tests/resources` — ERA5-Land GRIB for the readers,
+converted Tethys forecasts (ECMWF SEAS5, IPMA, NOAA GFS) for the monthly adaptation and
+the resampling units contract, and a real 26-catchment KML layer for zonal aggregation.
+Those files are subsets; see
+[tests/resources/PROVENANCE.md](tests/resources/PROVENANCE.md) and
+`tools/make_fixtures.py`.
+
+Tests skip — by name, never error — when a resource is missing or when an optional
+dependency is absent, so a partial clone and a slim install both stay green. **Activate**
+the conda environment rather than calling its `python.exe` directly, or the GRIB tests
+skip on a `PATH` that hides ecCodes.
 
 ---
 
@@ -240,14 +350,14 @@ This produces both artifacts in `dist/`:
 
 ```
 dist/
-├── meteoraster-2.5-py3-none-any.whl
-└── meteoraster-2.5.tar.gz
+├── meteoraster-3.0-py3-none-any.whl
+└── meteoraster-3.0.tar.gz
 ```
 
 Install the wheel anywhere (provided GDAL is available):
 
 ```bat
-pip install dist/meteoraster-2.5-py3-none-any.whl
+pip install dist/meteoraster-3.0-py3-none-any.whl
 ```
 
 Notes:
@@ -365,8 +475,36 @@ Things worth keeping that way:
 |---|---|
 | `get_values_from_latlon(lat, lon)` | Time series from the nearest pixel as a `DataFrame`. |
 | `get_values_from_KML(kml, nameField=None, …)` | Area-weighted aggregate over KML polygons → `(agg, centroids)`. |
-| `get_quantiles_from_KML(...)` | Spatial quantiles over KML zones — **under review, not functional**. |
+| `get_quantiles_from_KML(kml, nameField=None, quantiles=…, pool=('space',), resampling=None, …)` | Area-weighted spatial quantiles over KML zones → `(agg, centroids)`. `pool` names the axes folded into the sample; `resampling` is the block size within a pooled time axis. |
 | `get_values_from_latlon_by_event(production_date_dataframe)` | *(static)* Reindex a production-date frame by event date. |
+
+Since **v3.0** `get_values_from_KML` runs on `meteoraster.zonal` (below). Its numbers
+changed for any zone touching the edge of the grid: the legacy builder gave the
+outermost row and column no weight and took its validity threshold from the first
+zone. `ensemble_member` labels are now 0-based, matching the other extractors.
+
+**`meteoraster.zonal`** — needs no `MeteoRaster`; takes plain coordinate arrays.
+
+| Member | Description |
+|---|---|
+| `coverage_from_kml(kml, latitudes, longitudes, name_field=None, …)` | Build a `Coverage` from KML Placemark polygons. Namespace-agnostic, and it does not touch the input file. |
+| `coverage_from_geometries(latitudes, longitudes, geometries, names=None, …)` | Same from `ogr.Geometry`, WKB bytes or WKT — so PostGIS geometry feeds straight in. |
+| `apply_coverage(coverage, values, min_coverage=0.8)` | Area-weighted mean per zone of any array whose last two axes are (y, x). Renormalises for missing data and applies the threshold per zone and per slice. |
+| `quantiles_from_coverage(coverage, values, quantiles, pool_axes=(), …)` | Area-weighted spatial quantiles per zone. |
+| `weighted_quantiles(values, weights, quantiles, method='hazen')` | The quantile primitive. Reduces exactly to `np.quantile` for equal weights. |
+| `Coverage.save/load`, `Coverage.matches`, `grid_fingerprint` | Persist a coverage to a pickle-free `.npz` and check it against a grid; the fingerprint hashes the coordinates, so a shifted grid of the same shape is a miss. |
+| `cell_corners`, `cell_areas`, `cell_bounds` | The grid geometry, extrapolated half a cell at the boundary so no cell is skipped. |
+
+**`meteoraster.io`** — the portable read path.
+
+| Member | Description |
+|---|---|
+| `read_header(file)` | `Header` with coordinates, shape, dtype, units and the `complete` flag; reads no values. |
+| `iter_productions(file, productions=None, leadtimes=None, reduce_members=None, dtype=None)` | Yield `(production_datetime, block)`; peak memory is one block. |
+| `read_cube(file, …)` | Fill a whole or partial cube production by production. |
+| `open_raster(file, engine=None, **kwargs)` | Context manager over `xr.open_dataset` with engine fallback and pinned decoding. |
+| `read_completeness(file)` | The `complete` flag alone; `None` when the file has none. |
+| `available_engines()` | Which of `h5netcdf`, `netcdf4`, `scipy` this install can use. |
 
 **Quality & diagnostics**
 
@@ -381,8 +519,9 @@ Things worth keeping that way:
 
 | Member | Description |
 |---|---|
-| `save(file, complevel=1, complete=None)` | Write compressed NetCDF via `h5netcdf`. |
-| `load(file, verbose=None)` | *(classmethod)* Reload a NetCDF written by `save`. |
+| `save(file, complevel=1, complete=None, tmp_dir=None, mode=0o644, engine=None)` | Write compressed NetCDF via `h5netcdf`. Staged in the destination directory and swapped in with `os.replace`, so nothing goes through the system temp dir and the swap is atomic. |
+| `load(file, verbose=None, productions=None, leadtimes=None, dtype=None, engine=None)` | *(classmethod)* Reload a NetCDF written by `save`, optionally only part of it. |
+| `read_header(file)` / `iter_productions(file, …)` | *(classmethods)* Metadata-only and streaming reads; see `meteoraster.io`. |
 
 **Visualisation**
 

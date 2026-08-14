@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meteoraster"
-version = "2.5"
+version = "3.0"
 description = "Module for handling distributed ensemble and probabilistic forecast data (5-D meteorological rasters)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Jose Pedro Matos", email = "jose.matos@tecnico.ulisboa.pt" },
 ]
-keywords = ["meteorology", "forecast", "ensemble", "raster", "netcdf", "ERA5", "GFS", "C3S", "CORDEX"]
+keywords = ["meteorology", "forecast", "ensemble", "raster", "netcdf", "grib", "ERA5", "ERA5-Land"]
 # NOTE: no "License :: OSI Approved :: ..." classifier - PyPI rejects license
 # classifiers when a PEP 639 SPDX `license` expression is present.
 classifiers = [
@@ -33,12 +33,16 @@ classifiers = [
 # environment (see environment.yml). The KML aggregation helpers
 # (get_values_from_KML / get_quantiles_from_KML) require it.
 dependencies = [
-    "numpy<2",
+    "numpy>=1.26",
     "scipy",
     "pandas",
     "xarray",
     "netcdf4",
     "h5netcdf",
+    # h5netcdf >=1.6 has pluggable backends and no longer depends on h5py, so a
+    # bare `pip install h5netcdf` yields a backend-less install and save()/load()
+    # raise ImportError at open time. Declare it explicitly.
+    "h5py",
     "cfgrib",
     "cdsapi",
     "scikit-learn",
