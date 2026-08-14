@@ -123,6 +123,12 @@ runtime dependencies.
 
 ## Quick start
 
+> **Worked examples:** [`notebooks/`](notebooks/) holds seven short Jupyter notebooks —
+> the 5-D data model, I/O and xarray, cropping, plotting, point time series, catchment
+> aggregation from KML, and resampling. They run on the real files in
+> [tests/resources](tests/resources) and are committed **with their outputs**, so every
+> table and figure is readable on GitHub without running anything.
+
 ```python
 import numpy as np
 import pandas as pd
@@ -293,6 +299,7 @@ Tethys-meteoraster/
 │   ├── resample.py            # Resample (time-step resampling of DataFrames)
 │   ├── _lazy.py               # on-demand GDAL / matplotlib / seaborn / cartopy
 │   └── utils.py               # ERA5-Land GRIB readers
+├── notebooks/                 # seven worked examples, executed (see notebooks/README.md)
 ├── tests/                     # pytest suite + fixtures (conftest.py)
 │   └── resources/             # real GRIB/NetCDF inputs (see PROVENANCE.md)
 ├── tools/make_fixtures.py     # regenerates the subsetted test fixtures

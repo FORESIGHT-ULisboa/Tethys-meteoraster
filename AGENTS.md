@@ -41,6 +41,7 @@ Deterministic and single-member datasets just use size-1 ensemble/leadtime axes.
 | [meteoraster/utils.py](meteoraster/utils.py) | ERA5-Land GRIB readers (monthly means, hourly) |
 | [meteoraster/__init__.py](meteoraster/__init__.py) | Exports `MeteoRaster`, `Resample` (note: `utils` is imported as a submodule) |
 | [tests/](tests/) | pytest suite + fixtures ([tests/conftest.py](tests/conftest.py)) |
+| [notebooks/](notebooks/) | seven worked examples, committed **with outputs**, run against `tests/resources` — see [notebooks/README.md](notebooks/README.md) |
 
 `io.py` and `zonal.py` are deliberately independent of `MeteoRaster` and of each
 other: both take plain arrays, so a caller can stream one production block off disk
@@ -176,6 +177,22 @@ pip install -e ".[dev]"
 pytest -ra                                # run the suite
 python -m build                           # wheel + sdist into dist/
 ```
+
+**Notebooks.** [notebooks/](notebooks/) is committed **with its outputs**, so it goes stale
+silently if the API changes. Re-execute from the repository root with
+
+```bat
+jupyter nbconvert --to notebook --execute --inplace notebooks/*.ipynb
+```
+
+which fails on the first cell error and so doubles as a coarse smoke test of the public API
+against the real fixtures. They read `tests/resources` through a relative path and put the
+repository root on `sys.path` when `meteoraster` is not installed, so a plain clone runs
+them. They are not in the sdist or the wheel (`MANIFEST.in` ships only `tests/*.py`, and
+`packages.find` only matches `meteoraster*`). Two constraints if you edit them: display
+leadtimes through `pd.to_timedelta` — the raw numpy `timedelta64` renders as
+`10800000000000 nanoseconds` — and keep absolute paths out of the outputs, which is what the
+`warnings.formatwarning` override in each preamble is for.
 
 [.github/workflows/tests.yml](.github/workflows/tests.yml) runs the suite on push
 and pull request, in two jobs that catch different things:
