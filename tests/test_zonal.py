@@ -3,10 +3,14 @@ Numeric tests for meteoraster.zonal on a grid whose weights are computable on pa
 
 The 3x3 fixture grid (see conftest) has cells of area exactly 1, spanning
 lon [j-0.5, j+0.5] and lat [2-i-0.5, 2-i+0.5], so every expected weight below is
-an exact fraction rather than a tolerance.
+an exact fraction rather than a tolerance. Those are square-degree weights, so the
+on-paper tests pin area_weighting='planar'; the WGS84 weighting is tested against
+pyproj at the end.
 '''
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -15,6 +19,8 @@ import pytest
 from meteoraster import zonal
 from conftest import (GRID_LATS, GRID_LONS, RING_WHOLE, RING_MIDDLE, RING_WEST_HALF,
                       RING_ONE_AND_QUARTER, gdal_required, write_kml)
+
+PLANAR = dict(area_weighting='planar')
 
 WHOLE_WKT = 'POLYGON ((-0.5 -0.5, 2.5 -0.5, 2.5 2.5, -0.5 2.5, -0.5 -0.5))'
 MIDDLE_WKT = 'POLYGON ((0.5 0.5, 1.5 0.5, 1.5 1.5, 0.5 1.5, 0.5 0.5))'
@@ -79,7 +85,8 @@ def test_as_grid_rejects_a_degenerate_grid():
 
 @gdal_required
 def test_whole_grid_zone_catches_every_cell_including_the_corners():
-    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'])
+    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'],
+                                              **PLANAR)
 
     index, weight = coverage.cells(0)
 
@@ -174,7 +181,8 @@ def test_halo_does_not_change_the_weights():
 @gdal_required
 def test_cos_lat_weighting_rescales_but_keeps_a_uniform_field():
     values = np.full((1, 3, 3), 4.0)
-    planar = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'])
+    planar = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'],
+                                            **PLANAR)
     scaled = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'],
                                            area_weighting='cos_lat')
 
@@ -269,7 +277,8 @@ def test_polygon_with_a_hole(tmp_path):
         '</coordinates></LinearRing></innerBoundaryIs>'
         '</Polygon></Placemark></Document></kml>\n', encoding='utf-8')
 
-    coverage = zonal.coverage_from_kml(path, GRID_LATS, GRID_LONS, name_field='zone_id')
+    coverage = zonal.coverage_from_kml(path, GRID_LATS, GRID_LONS, name_field='zone_id',
+                                       **PLANAR)
 
     index, weight = coverage.cells(0)
     assert 4 not in index.tolist()          # the centre cell is the hole
@@ -299,7 +308,8 @@ def test_name_field_falls_back_to_the_name_element(tmp_path):
 
 @gdal_required
 def test_area_weighted_mean_uses_the_whole_grid():
-    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'])
+    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'],
+                                              **PLANAR)
     values = np.arange(9, dtype=float).reshape(1, 3, 3)
 
     # mean(0..8) = 4.0, not the centre cell's 4 by coincidence: see the asymmetric
@@ -318,7 +328,8 @@ def test_weighted_mean_of_partial_cells():
 
 @gdal_required
 def test_missing_data_is_renormalised_per_zone():
-    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'])
+    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'],
+                                              **PLANAR)
     values = np.arange(9, dtype=float).reshape(1, 3, 3)
 
     values[0, 0, 0] = np.nan
@@ -567,3 +578,111 @@ def test_quantiles_from_coverage_respects_min_coverage():
     got = zonal.quantiles_from_coverage(coverage, values, [0.5], min_coverage=0.8)
 
     assert np.isnan(got[0, 0, 0])
+
+
+# --------------------------------------------------------------------------- #
+# WGS84 area weighting, grid fraction, reuse checks
+# --------------------------------------------------------------------------- #
+
+def _geod_rectangle_km2(west, east, south, north):
+    '''pyproj area of a lon/lat rectangle, parallels densified so geodesic == straight.'''
+    pyproj = pytest.importorskip('pyproj')
+    t = np.linspace(0.0, 1.0, 400)
+    lons = np.concatenate([west + (east - west) * t, np.full(t.size, east),
+                           east - (east - west) * t, np.full(t.size, west)])
+    lats = np.concatenate([np.full(t.size, south), south + (north - south) * t,
+                           np.full(t.size, north), north - (north - south) * t])
+    area, _ = pyproj.Geod(ellps='WGS84').polygon_area_perimeter(lons, lats)
+    return abs(area) / 1e6
+
+
+@pytest.mark.parametrize('south', [-89.0, -45.0, 0.0, 30.0, 60.0, 75.0, 88.0])
+def test_ellipsoidal_ring_area_matches_pyproj(south):
+    expected = _geod_rectangle_km2(10.0, 12.0, south, south + 1)
+
+    area = zonal.ring_area(np.array([10.0, 12.0, 12.0, 10.0]),
+                           np.array([south, south, south + 1, south + 1]))
+
+    assert area == pytest.approx(expected, rel=1e-6)
+
+
+def test_ellipsoidal_cell_areas_are_true_areas():
+    lats = np.array([60.5, 60.0, 59.5])
+    lons = np.array([0.0, 0.5, 1.0])
+    corner_lat, corner_lon = zonal.cell_corners(lats, lons)
+
+    areas = zonal.cell_areas(corner_lat, corner_lon, 'ellipsoidal')
+
+    assert areas[0, 0] == pytest.approx(_geod_rectangle_km2(-0.25, 0.25, 60.25, 60.75), rel=1e-6)
+    assert areas[2, 0] == pytest.approx(_geod_rectangle_km2(-0.25, 0.25, 59.25, 59.75), rel=1e-6)
+
+
+@gdal_required
+def test_ellipsoidal_is_the_default_and_planar_reproduces_v30():
+    lats = np.arange(70.0, 49.0, -1.0)
+    lons = np.arange(0.0, 6.0, 1.0)
+    wkt = 'POLYGON ((0.3 50.3, 5.3 50.3, 5.3 69.3, 0.3 69.3, 0.3 50.3))'
+    field = np.broadcast_to(np.meshgrid(lons, lats)[1], (1,) + (lats.size, lons.size))
+
+    default = zonal.coverage_from_geometries(lats, lons, [wkt], ['z'])
+    planar = zonal.coverage_from_geometries(lats, lons, [wkt], ['z'], area_weighting='planar')
+
+    assert default.area_weighting == 'ellipsoidal'
+    # planar is the plain-degree centroid; true areas pull it south (cos lat)
+    planar_mean = zonal.apply_coverage(planar, field)[0, 0]
+    true_mean = zonal.apply_coverage(default, field)[0, 0]
+    assert planar_mean == pytest.approx(59.8, abs=1e-6)
+    assert true_mean < planar_mean - 0.5
+
+
+@gdal_required
+def test_grid_fraction_reports_a_zone_partly_outside_the_grid():
+    half_out = 'POLYGON ((1.5 -0.5, 3.5 -0.5, 3.5 2.5, 1.5 2.5, 1.5 -0.5))'
+
+    with pytest.warns(UserWarning, match='partly outside the grid'):
+        coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT, half_out],
+                                                  ['all', 'half'])
+
+    np.testing.assert_allclose(coverage.grid_fraction, [1.0, 0.5], rtol=1e-3)
+    assert coverage.centroids.loc['half', 'grid_fraction'] == pytest.approx(0.5, rel=1e-3)
+
+    with pytest.raises(ValueError, match='partly outside the grid'):
+        zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [half_out], ['half'],
+                                       on_partial='raise')
+
+
+@gdal_required
+def test_a_zone_on_the_grid_border_is_fully_inside():
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT, QUARTER_WKT],
+                                                  ['all', 'quarter'])
+
+    np.testing.assert_allclose(coverage.grid_fraction, 1.0)
+
+
+@gdal_required
+def test_an_antimeridian_polygon_warns():
+    lats = np.array([56.0, 55.0, 54.0])
+    lons = np.array([178.0, 179.0, 180.0])
+    with pytest.warns(UserWarning, match='antimeridian'):
+        zonal.coverage_from_geometries(
+            lats, lons, ['POLYGON ((179 54.5, -179 54.5, -179 55.5, 179 55.5, 179 54.5))'],
+            ['dateline'], on_partial='ignore')
+
+
+@gdal_required
+def test_grid_fraction_round_trips_and_old_files_still_load(tmp_path):
+    coverage = zonal.coverage_from_geometries(GRID_LATS, GRID_LONS, [WHOLE_WKT], ['all'])
+    coverage.save(tmp_path / 'new.npz')
+    back = zonal.Coverage.load(tmp_path / 'new.npz')
+    np.testing.assert_allclose(back.grid_fraction, coverage.grid_fraction)
+    assert 'grid_fraction' in back.centroids.columns
+
+    # a v3.0 file has no grid_fraction key
+    coverage.grid_fraction = None
+    coverage.save(tmp_path / 'old.npz')
+    old = zonal.Coverage.load(tmp_path / 'old.npz')
+    assert old.grid_fraction is None
+    np.testing.assert_allclose(old.weight, coverage.weight)
+

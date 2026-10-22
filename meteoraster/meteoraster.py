@@ -20,6 +20,15 @@ class MeteoRaster(object):
     '''
     Custom class to handle meteorological raster files, including ensembles and forecasts
 
+    v3.1:
+        get_values_from_KML / get_quantiles_from_KML weight by true WGS84 area
+        (area_weighting='ellipsoidal', new default) instead of square degrees, which
+        over-weighted the poleward side of a zone by ~tan(lat) * lat-span. Pass
+        area_weighting='planar' to reproduce v3.0 exactly. A zone partly outside
+        the grid now warns (on_partial=) and centroids carry its grid_fraction. A
+        reused coverage_info built for another grid raises instead of aggregating
+        the wrong cells.
+
     v3.0:
         BREAKING - four readers are gone. meteoraster.utils keeps only
         readERA5Land_monthly and read_ERA5Land_hourly; readERA5_monthly, read_GFS,
@@ -178,7 +187,7 @@ class MeteoRaster(object):
         Untested support for pd.DateOffset
     '''
     
-    VERSION = '3.0'
+    VERSION = '3.1'
     VERBOSE = True
     ENSEMBLEMEMBERpOSITION = 1
 
@@ -412,7 +421,8 @@ class MeteoRaster(object):
         return ax
 
     def get_values_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False,
-                            elementwise=False, min_coverage=None, on_error='raise'):
+                            elementwise=False, min_coverage=None, on_error='raise',
+                            area_weighting=None, on_partial='warn'):
         '''
         Area-weighted mean of each KML zone, per production, member and leadtime.
 
@@ -434,6 +444,13 @@ class MeteoRaster(object):
               zonal.MIN_COVERAGE.
         elementwise: accepted for backwards compatibility and ignored. It skipped the
               missing-data renormalisation, which apply_coverage now always applies.
+        area_weighting: 'ellipsoidal' (default, true WGS84 areas), 'cos_lat', or
+              'planar' (square degrees) to reproduce v3.0 numbers. See zonal.
+        on_partial: 'warn' (default), 'raise' or 'ignore' for zones partly outside
+              the grid; centroids['grid_fraction'] holds the share inside.
+
+        A reused coverage_info must have been built for this exact grid (checked by
+        fingerprint for zonal.Coverage, by shape for the legacy tuple).
         '''
 
         if elementwise:
@@ -447,10 +464,13 @@ class MeteoRaster(object):
         if isinstance(coverage_info, type(None)):
             coverage = _zonal.coverage_from_kml(kml, self.latitudes, self.longitudes,
                                                 name_field=nameField, on_error=on_error,
-                                                normalize='area')
+                                                normalize='area',
+                                                area_weighting=area_weighting or _zonal.DEFAULT_AREA_WEIGHTING,
+                                                on_partial=on_partial)
             coverage_info = coverage
         else:
             coverage = self.__as_coverage(coverage_info)
+            self.__check_coverage(coverage)
 
         agg = self.__groupByCoverage(coverage, min_coverage)
 
@@ -464,7 +484,8 @@ class MeteoRaster(object):
     def get_quantiles_from_KML(self, kml, nameField=None, coverage_info=None, getCoverageInfo=False,
                                resampling=None, quantiles=(0.01, 0.1, 0.5, 0.9, 0.99),
                                pool=('space',), min_coverage=None, method='hazen',
-                               precision=None, on_error='raise'):
+                               precision=None, on_error='raise', area_weighting=None,
+                               on_partial='warn'):
         '''
         Area-weighted spatial quantiles over the KML zones.
 
@@ -501,6 +522,7 @@ class MeteoRaster(object):
         method: 'hazen' (default) or 'linear'. See zonal.weighted_quantiles.
         precision: accepted for backwards compatibility, ignored, and warns when
               passed - the result no longer depends on it.
+        area_weighting, on_partial: as in get_values_from_KML.
         '''
 
         if precision is not None:
@@ -515,10 +537,13 @@ class MeteoRaster(object):
         if isinstance(coverage_info, type(None)):
             coverage = _zonal.coverage_from_kml(kml, self.latitudes, self.longitudes,
                                                 name_field=nameField, on_error=on_error,
-                                                normalize='cell_fraction')
+                                                normalize='cell_fraction',
+                                                area_weighting=area_weighting or _zonal.DEFAULT_AREA_WEIGHTING,
+                                                on_partial=on_partial)
             coverage_info = coverage
         else:
             coverage = self.__as_coverage(coverage_info)
+            self.__check_coverage(coverage)
 
         agg = self.__groupByQuantile(coverage, resampling, quantiles, pool, min_coverage, method)
 
@@ -545,6 +570,16 @@ class MeteoRaster(object):
 
         raise TypeError('coverage_info must be a zonal.Coverage or a legacy '
                         '(coverage, columns, centroids) tuple.')
+
+    def __check_coverage(self, coverage):
+        '''
+        Raises if a reused coverage was built for a different grid.
+        '''
+
+        if not coverage.matches(self.latitudes, self.longitudes):
+            raise ValueError('coverage_info was built for a different grid (shape %s or '
+                             'coordinates differ from this raster %s). Rebuild it from the KML.'
+                             % (coverage.shape, self.latitudes.shape))
 
     def get_cropped(self, from_prod_date=dt.datetime(1900, 1, 1), to_prod_date=dt.datetime(2199, 12, 31),
                    from_lat=-90, to_lat=90, from_lon=-180, to_lon=180,

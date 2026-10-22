@@ -225,3 +225,15 @@ def test_dateoffset_leadtimes_cannot_be_pooled_with_a_rule(two_zone_kml):
         two_zone_kml, nameField='zone_id', quantiles=[1.0],
         pool=('space', 'leadtime'), resampling=None)
     assert aggregate[('whole', 1.0)].iloc[0] == pytest.approx(20.0)
+
+
+def test_a_coverage_for_another_grid_is_rejected(grid_raster, two_zone_kml):
+    _, _, coverage = grid_raster.get_quantiles_from_KML(kml=str(two_zone_kml), nameField='zone_id',
+                                                        getCoverageInfo=True)
+    shifted = grid_raster.copy()
+    shifted.latitudes = shifted.latitudes + 0.25
+
+    with pytest.raises(ValueError, match='different grid'):
+        shifted.get_quantiles_from_KML(kml=str(two_zone_kml), coverage_info=coverage)
+    with pytest.raises(ValueError, match='different grid'):
+        shifted.get_values_from_KML(kml=str(two_zone_kml), coverage_info=coverage)

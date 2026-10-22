@@ -26,6 +26,10 @@ Coordinate handling, applied automatically in `__init__`:
 - `latitudes` / `longitudes` are stored as **2-D meshgrids**; 1-D inputs are meshed.
 - Longitudes are wrapped from `[0, 360]` to `[-180, 180]` (`_fixStartAtGreenwich`).
 - Latitudes are flipped to descending order if needed (`_flipLatitude`).
+- Coordinates are WGS84 lon/lat of cell **centres**. Projected sources (e.g. the
+  RADCLIM radar on EPSG:3812, CERRA) are stored as 2-D curvilinear centre arrays; the
+  native CRS is not kept. `zonal.cell_corners` rebuilds corners by averaging the four
+  neighbouring centres (measured 2-8 cm off the exact EPSG:3812 corners on RADCLIM).
 
 Deterministic and single-member datasets just use size-1 ensemble/leadtime axes.
 
@@ -78,7 +82,10 @@ persist to a pickle-free `.npz`, and `grid_fingerprint` is the cache key — it 
 the coordinates, not just the shape, so a grid that keeps its shape but shifts its
 geolocation is a miss. `weighted_quantiles` / `quantiles_from_coverage` give exact
 area-weighted quantiles. Geometries may be `ogr.Geometry`, WKB bytes or WKT, so
-PostGIS output feeds straight in.
+PostGIS output feeds straight in. Weights default to true WGS84 areas
+(`area_weighting='ellipsoidal'`, exact on the authalic sphere for edges straight in
+lon/lat; matches pyproj geodesic areas to ~1e-9); `'planar'` (square degrees)
+reproduces v3.0. `Coverage.grid_fraction` is the share of each zone on the grid.
 
 **`Resample.resample(data, timestep_frequency, resamplingType, …)`** (classmethod)
 resamples a `DataFrame` whose columns carry a `leadtime` level. `resamplingType` ∈
@@ -277,6 +284,18 @@ workflow:
   can upload them.
 
 ## Known rough edges
+
+- **v3.1 changed the default zonal weights** from square degrees to WGS84 areas.
+  Square degrees are *not* cancelled by per-zone normalisation: the weight error
+  grows as ~tan(lat) x lat-span (5 deg zone at 60 N: 8 % per cell, 7 km shift of the
+  effective centroid). `area_weighting='planar'` reproduces v3.0 bit for bit.
+- A zone **partly outside the grid** still gets a mean over the part inside (now
+  warned, `on_partial=`, and reported in `grid_fraction`). Polygons crossing the
+  **antimeridian** are not supported (warned); split them at +/-180. Corners of a
+  polar row extrapolate past +/-90.
+- `get_values_from_KML(coverage_info=...)` raises when the coverage's grid
+  fingerprint differs from the raster's. Fingerprints were measured stable across
+  all stored ECMWF HRES days and RADCLIM months, so reuse across files is fine.
 
 - **`get_values_from_KML` was rewired onto `meteoraster.zonal` in v3.0** and is no
   longer a rough edge. What changed, since it changes returned numbers: the legacy

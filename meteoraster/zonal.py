@@ -16,9 +16,15 @@ Properties worth knowing:
   weighting the whole grid. Peak memory is one block, not block x zones.
 - Missing data is renormalised and the coverage threshold applied *per zone and per
   slice*, never taking one zone as representative of the others.
-- Weights are areas in square degrees (`area_weighting='planar'`). They are
-  normalised per zone, so the cos(latitude) factor nearly cancels across a basin;
-  for continental or high-latitude zones pass `area_weighting='cos_lat'`.
+- Coordinates are WGS84 lon/lat of cell *centres*; KML edges are straight lines
+  in lon/lat. Overlaps are cut in that plane.
+- Weights default to true WGS84 areas (`area_weighting='ellipsoidal'`, exact on
+  the authalic sphere). `'planar'` (square degrees, the v3.0 default) is kept as a
+  fall-back. Normalising per zone does *not* cancel the cos(latitude) factor:
+  planar weights within a zone are off by ~tan(lat) * lat_span (5 deg span at
+  60 deg: ~15 %). `'cos_lat'` scales each overlap by its cell-centre cos(lat).
+- A zone partly outside the grid is averaged over the part inside; the fraction
+  inside is `Coverage.grid_fraction` and `on_partial` warns about it.
 
 Since v3.0 MeteoRaster.get_values_from_KML and get_quantiles_from_KML both run on
 this module; the coverage builder they used before got the first and third points
@@ -43,7 +49,16 @@ from . import _lazy
 #: changes how the stored weights read.
 NORMALISATIONS = ('area', 'cell_fraction', 'none')
 
-AREA_WEIGHTINGS = ('planar', 'cos_lat')
+AREA_WEIGHTINGS = ('ellipsoidal', 'cos_lat', 'planar')
+
+DEFAULT_AREA_WEIGHTING = 'ellipsoidal'
+
+#: A zone whose grid_fraction is below 1 - this is reported by on_partial.
+GRID_FRACTION_TOLERANCE = 1e-3
+
+# WGS84 semi-major axis (m) and first eccentricity.
+_WGS84_A = 6378137.0
+_WGS84_E = 0.0818191908426215
 
 #: Weighted-quantile plotting positions. See weighted_quantiles() for why
 #: 'hazen' is the default rather than the numpy-'linear'-compatible option.
@@ -132,9 +147,11 @@ def cell_bounds(corner_lat, corner_lon):
     return lat_min, lat_max, lon_min, lon_max
 
 
-def cell_areas(corner_lat, corner_lon):
+def cell_areas(corner_lat, corner_lon, area_weighting='planar'):
     '''
-    Returns each cell's area (rows, cols) by the shoelace formula on its quad.
+    Returns each cell's area (rows, cols) from its quad.
+
+    'planar': square degrees (shoelace). 'ellipsoidal': km^2 on WGS84.
     '''
 
     x = np.stack((corner_lon[:-1, :-1], corner_lon[:-1, 1:],
@@ -142,12 +159,80 @@ def cell_areas(corner_lat, corner_lon):
     y = np.stack((corner_lat[:-1, :-1], corner_lat[:-1, 1:],
                   corner_lat[1:, 1:], corner_lat[1:, :-1]))
 
+    if area_weighting == 'ellipsoidal':
+        return ring_area(x, y)
+
     total = np.zeros(x.shape[1:], dtype=float)
     for i in range(4):
         j = (i + 1) % 4
         total += x[i] * y[j] - x[j] * y[i]
 
     return np.abs(total) * 0.5
+
+
+def authalic_latitude(latitudes):
+    '''
+    Returns the WGS84 authalic latitude (degrees): equal-area latitude on a sphere.
+    '''
+
+    e = _WGS84_E
+    sin_phi = np.sin(np.radians(np.clip(np.asarray(latitudes, dtype=float), -90.0, 90.0)))
+
+    def q(s):
+        return (1 - e ** 2) * (s / (1 - (e * s) ** 2)
+                               - np.log((1 - e * s) / (1 + e * s)) / (2 * e))
+
+    return np.degrees(np.arcsin(np.clip(q(sin_phi) / q(1.0), -1.0, 1.0)))
+
+
+def _authalic_radius_km():
+    e = _WGS84_E
+    q_pole = (1 - e ** 2) * (1 / (1 - e ** 2) - np.log((1 - e) / (1 + e)) / (2 * e))
+
+    return _WGS84_A * np.sqrt(q_pole / 2) / 1000.0
+
+
+def ring_area(lon, lat):
+    '''
+    Area (km^2) enclosed by rings on WGS84, edges straight in lon/lat.
+
+    lon, lat: [n_vertices, ...] degrees; the ring closes itself (a repeated
+    first vertex adds a zero-length edge). Exact on the authalic sphere for edges
+    linear in (lon, authalic lat), i.e. the integral of cos(beta) dbeta dlon.
+    No antimeridian handling.
+    '''
+
+    lam = np.radians(np.asarray(lon, dtype=float))
+    beta = np.radians(authalic_latitude(lat))
+
+    d_lam = np.roll(lam, -1, axis=0) - lam
+    beta_next = np.roll(beta, -1, axis=0)
+    # (cos b1 - cos b2) / (b2 - b1), stable as b2 -> b1
+    strip = np.sin(0.5 * (beta + beta_next)) * np.sinc((beta_next - beta) / (2 * np.pi))
+
+    return np.abs((d_lam * strip).sum(axis=0)) * _authalic_radius_km() ** 2
+
+
+def geometry_area(geometry):
+    '''
+    Area (km^2) on WGS84 of an ogr polygon, multipolygon or collection (holes subtracted).
+    '''
+
+    name = geometry.GetGeometryName()
+    if name == 'POLYGON':
+        total = 0.0
+        for i in range(geometry.GetGeometryCount()):
+            points = np.asarray(geometry.GetGeometryRef(i).GetPoints() or [], dtype=float)
+            if points.shape[0] < 3:
+                continue
+            area = float(ring_area(points[:, 0], points[:, 1]))
+            total += area if i == 0 else -area
+        return total
+    if name in ('MULTIPOLYGON', 'GEOMETRYCOLLECTION'):
+        return sum(geometry_area(geometry.GetGeometryRef(i))
+                   for i in range(geometry.GetGeometryCount()))
+
+    return 0.0
 
 
 def grid_fingerprint(latitudes, longitudes):
@@ -201,6 +286,8 @@ class Coverage:
     offsets    : len(zones)+1 offsets into cell_index / weight
     cell_index : flat (row * cols + col) indices, concatenated over zones
     weight     : matching weights, concatenated over zones
+    grid_fraction : per zone, share of the polygon's area that lies on the grid
+                    (None for coverages built before v3.1)
     '''
 
     zones: list
@@ -213,6 +300,7 @@ class Coverage:
     normalize: str = 'area'
     area_weighting: str = 'planar'
     fingerprint: str = ''
+    grid_fraction: np.ndarray = None
 
     def __len__(self):
         return len(self.zones)
@@ -226,6 +314,10 @@ class Coverage:
             raise ValueError('offsets must have len(zones)+1 entries.')
         if self.cell_index.size != self.weight.size:
             raise ValueError('cell_index and weight must have the same length.')
+        if self.grid_fraction is not None:
+            self.grid_fraction = np.asarray(self.grid_fraction, dtype=np.float64)
+            if self.grid_fraction.size != len(self.zones):
+                raise ValueError('grid_fraction must have one entry per zone.')
 
     @property
     def shape(self):
@@ -314,8 +406,13 @@ class Coverage:
             centroids = pd.DataFrame({'x': np.full(len(self), np.nan),
                                       'y': np.full(len(self), np.nan)}, index=self.zones)
 
+        extra = {}
+        if self.grid_fraction is not None:
+            extra['grid_fraction'] = self.grid_fraction
+
         np.savez_compressed(
             str(file),
+            **extra,
             zones=np.asarray([str(z) for z in self.zones], dtype='U'),
             grid=np.asarray([self.rows, self.cols], dtype='int64'),
             offsets=self.offsets,
@@ -338,13 +435,18 @@ class Coverage:
             meta = [str(v) for v in payload['meta']]
             centroids = pd.DataFrame({'x': payload['centroid_x'],
                                       'y': payload['centroid_y']}, index=zones)
+            grid_fraction = None
+            if 'grid_fraction' in payload.files:
+                grid_fraction = payload['grid_fraction']
+                centroids['grid_fraction'] = grid_fraction
 
             return cls(zones=zones, rows=rows, cols=cols,
                        offsets=payload['offsets'],
                        cell_index=payload['cell_index'],
                        weight=payload['weight'],
                        centroids=centroids,
-                       normalize=meta[0], area_weighting=meta[1], fingerprint=meta[2])
+                       normalize=meta[0], area_weighting=meta[1], fingerprint=meta[2],
+                       grid_fraction=grid_fraction)
 
     def matches(self, latitudes, longitudes):
         '''
@@ -576,12 +678,17 @@ def _as_geometry(ogr, geometry):
 
 def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
                              halo=1, buffer=None, normalize='area',
-                             area_weighting='planar', min_area=0.0,
-                             on_empty='warn'):
+                             area_weighting=DEFAULT_AREA_WEIGHTING, min_area=0.0,
+                             on_empty='warn', on_partial='warn'):
     '''
     Builds a Coverage by exact fractional overlap of each cell with each polygon.
 
-    geometries: ogr.Geometry, WKB bytes or WKT strings.
+    geometries: ogr.Geometry, WKB bytes or WKT strings, WGS84 lon/lat.
+    area_weighting: 'ellipsoidal' (km^2 on WGS84, default), 'cos_lat', or
+                'planar' (square degrees; reproduces v3.0).
+    min_area:   overlaps at or below this are dropped, in the units of the
+                overlap before normalisation (square degrees for 'planar' and
+                'cos_lat', km^2 for 'ellipsoidal').
     halo:       extra rings of candidate cells. The envelope prefilter is already
                 conservative, so this is only numerical insurance; it is cheap
                 because non-overlapping candidates contribute zero area and are
@@ -592,6 +699,9 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
     buffer:     legacy envelope padding in degrees, applied in addition to halo.
     on_empty:   what to do about a zone that caught no cell ('warn', 'raise',
                 'ignore'). It used to be a ValueError from min() of an empty array.
+    on_partial: what to do about a zone partly outside the grid ('warn', 'raise',
+                'ignore'). Its mean is taken over the part inside, renormalised,
+                so it looks plausible; `grid_fraction` says how much is inside.
     '''
 
     if normalize not in NORMALISATIONS:
@@ -600,6 +710,8 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
         raise ValueError('area_weighting must be one of %s.' % ', '.join(AREA_WEIGHTINGS))
     if on_empty not in ('warn', 'raise', 'ignore'):
         raise ValueError("on_empty must be 'warn', 'raise' or 'ignore'.")
+    if on_partial not in ('warn', 'raise', 'ignore'):
+        raise ValueError("on_partial must be 'warn', 'raise' or 'ignore'.")
 
     ogr = _lazy.ogr()
     latitudes, longitudes = as_grid(latitudes, longitudes)
@@ -607,7 +719,10 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
 
     corner_lat, corner_lon = cell_corners(latitudes, longitudes)
     lat_min, lat_max, lon_min, lon_max = cell_bounds(corner_lat, corner_lon)
-    areas = cell_areas(corner_lat, corner_lon) if normalize == 'cell_fraction' else None
+    areas = None
+    if normalize == 'cell_fraction':
+        areas = cell_areas(corner_lat, corner_lon,
+                           'ellipsoidal' if area_weighting == 'ellipsoidal' else 'planar')
 
     scale = None
     if area_weighting == 'cos_lat':
@@ -623,13 +738,18 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
     offsets = [0]
     all_index, all_weight = [], []
     centroid_x, centroid_y = [], []
-    empty = []
+    grid_fraction = []
+    empty, wide = [], []
 
     pad = 0.0 if buffer is None else float(buffer)
 
     for name, raw in zip(names, geometries):
         polygon = _as_geometry(ogr, raw)
         west, east, south, north = polygon.GetEnvelope()
+        if east - west > 180:
+            wide.append(name)
+        polygon_area = geometry_area(polygon)
+        inside_area = 0.0
 
         # Conservative: a cell can only intersect the polygon if its bounding box
         # overlaps the polygon's envelope.
@@ -665,7 +785,9 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
             # line or a point; Area() would warn on stdout and return 0 anyway.
             if overlap.GetDimension() != 2:
                 continue
-            area = overlap.Area()
+            true_area = geometry_area(overlap)
+            inside_area += true_area
+            area = true_area if area_weighting == 'ellipsoidal' else overlap.Area()
             if area <= min_area:
                 continue
 
@@ -680,6 +802,7 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
 
         if not index:
             empty.append(name)
+        grid_fraction.append(min(inside_area / polygon_area, 1.0) if polygon_area > 0 else 0.0)
 
         weight = np.asarray(weight, dtype=float)
         if normalize == 'area' and weight.size and weight.sum() > 0:
@@ -698,7 +821,22 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
         if on_empty == 'warn':
             warnings.warn(message)
 
-    centroids = pd.DataFrame({'x': centroid_x, 'y': centroid_y}, index=names)
+    partial = ['%s (%.1f%%)' % (name, 100 * fraction) for name, fraction in zip(names, grid_fraction)
+               if name not in empty and fraction < 1 - GRID_FRACTION_TOLERANCE]
+    if partial and on_partial != 'ignore':
+        message = ('%d zone(s) lie partly outside the grid: %s (share inside). Their means '
+                   'cover only that share.' % (len(partial), ', '.join(partial)))
+        if on_partial == 'raise':
+            raise ValueError(message)
+        warnings.warn(message)
+
+    if wide:
+        warnings.warn('%d zone(s) span more than 180 deg of longitude: %s. Polygons crossing '
+                      'the antimeridian are not supported; split them at +/-180.'
+                      % (len(wide), ', '.join(wide)))
+
+    centroids = pd.DataFrame({'x': centroid_x, 'y': centroid_y,
+                              'grid_fraction': grid_fraction}, index=names)
 
     return Coverage(
         zones=names, rows=rows, cols=cols,
@@ -707,6 +845,7 @@ def coverage_from_geometries(latitudes, longitudes, geometries, names=None,
         weight=(np.concatenate(all_weight) if all_weight else np.zeros(0, float)),
         centroids=centroids, normalize=normalize, area_weighting=area_weighting,
         fingerprint=grid_fingerprint(latitudes, longitudes),
+        grid_fraction=np.asarray(grid_fraction, dtype=float),
     )
 
 

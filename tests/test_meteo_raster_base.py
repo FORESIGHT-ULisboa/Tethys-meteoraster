@@ -231,7 +231,8 @@ def test_get_values_from_kml_covers_the_grid_border(grid_raster, grid_kml):
 
     pytest.importorskip('osgeo')
 
-    agg, centroids = grid_raster.get_values_from_KML(kml=str(grid_kml), nameField='zone_id')
+    agg, centroids = grid_raster.get_values_from_KML(kml=str(grid_kml), nameField='zone_id',
+                                                     area_weighting='planar')
 
     whole = agg.xs('whole', axis=1, level='zone')
     middle = agg.xs('middle', axis=1, level='zone')

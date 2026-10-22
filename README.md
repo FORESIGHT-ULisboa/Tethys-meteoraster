@@ -185,9 +185,18 @@ ts = mr.get_values_from_latlon(lat=35.0, lon=0.0)
 
 ```python
 # agg: DataFrame indexed by production date, columns MultiIndex(zone, leadtime, ensemble_member)
-# centroids: DataFrame of zone centroids (x, y)
+# centroids: DataFrame of zone centroids (x, y) and grid_fraction (share of the zone on the grid)
 agg, centroids = mr.get_values_from_KML("zones.kml", nameField="zone_id")
+
+# v3.0 numbers (square-degree weights) instead of true WGS84 areas
+agg, centroids = mr.get_values_from_KML("zones.kml", nameField="zone_id",
+                                        area_weighting="planar")
 ```
+
+Coordinates are WGS84 lon/lat of cell **centres** (curvilinear 2-D grids included);
+KML edges are straight lines in lon/lat. Weights are true WGS84 areas by default.
+A zone partly outside the grid is averaged over the part inside and warns
+(`on_partial=`); a reused `coverage_info` must match the raster's grid.
 
 Spatial **quantiles** over the same zones, area-weighted so a cell half inside a
 zone carries half the probability mass:
@@ -490,6 +499,12 @@ changed for any zone touching the edge of the grid: the legacy builder gave the
 outermost row and column no weight and took its validity threshold from the first
 zone. `ensemble_member` labels are now 0-based, matching the other extractors.
 
+Since **v3.1** the default weights are true WGS84 areas (`area_weighting='ellipsoidal'`)
+instead of square degrees. Square degrees over-weight the poleward side of a zone by
+roughly tan(lat) x lat-span: measured 1 % less rain over a Zambezi-sized basin, 0.02 %
+on the Vesdre catchments, 8 % on a single cell weight for a 5 deg zone at 60 N. Pass
+`area_weighting='planar'` to reproduce v3.0 exactly.
+
 **`meteoraster.zonal`** — needs no `MeteoRaster`; takes plain coordinate arrays.
 
 | Member | Description |
@@ -500,7 +515,8 @@ zone. `ensemble_member` labels are now 0-based, matching the other extractors.
 | `quantiles_from_coverage(coverage, values, quantiles, pool_axes=(), …)` | Area-weighted spatial quantiles per zone. |
 | `weighted_quantiles(values, weights, quantiles, method='hazen')` | The quantile primitive. Reduces exactly to `np.quantile` for equal weights. |
 | `Coverage.save/load`, `Coverage.matches`, `grid_fingerprint` | Persist a coverage to a pickle-free `.npz` and check it against a grid; the fingerprint hashes the coordinates, so a shifted grid of the same shape is a miss. |
-| `cell_corners`, `cell_areas`, `cell_bounds` | The grid geometry, extrapolated half a cell at the boundary so no cell is skipped. |
+| `cell_corners`, `cell_areas`, `cell_bounds` | The grid geometry, extrapolated half a cell at the boundary so no cell is skipped. `cell_areas(..., 'ellipsoidal')` gives km². |
+| `ring_area`, `geometry_area`, `authalic_latitude` | Exact WGS84 areas (km²) of lon/lat rings and ogr polygons, used by `area_weighting='ellipsoidal'`. |
 
 **`meteoraster.io`** — the portable read path.
 
