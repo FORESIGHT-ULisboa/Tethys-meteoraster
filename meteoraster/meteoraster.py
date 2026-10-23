@@ -296,6 +296,10 @@ class MeteoRaster(object):
         if crs is None:
             crs = ccrs.PlateCarree()
 
+        # Recent PROJ (seen on 9.8) rejects central_longitude=None ("+pm" with no value)
+        if central_longitude is None:
+            central_longitude = 0.0
+
         plt.figure(figsize=figsize)
         projection = projection_fun(central_longitude=central_longitude, **projection_kwargs)
         ax = plt.axes(projection=projection)
